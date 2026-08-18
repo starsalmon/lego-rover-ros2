@@ -1,0 +1,3 @@
+[INFO] [1786790361.588696268] [rover_sonar_escape_recorder]: Sonar escape recorder → /home/cain/rover_sonar_escape_20260815_203759
+[INFO] [1786790372.834458148] [rover_sonar_escape_recorder]: escape #1: esp_turn=+0 best=90° 0.00m front_bins=8 rear=none
+[INFO] [1786790375.454842009] [rover_sonar_escape_recorder]: followup #1: imu left esp straight want left → ok

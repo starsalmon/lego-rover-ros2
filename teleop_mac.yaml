@@ -1,0 +1,14 @@
+/**:
+  ros__parameters:
+    scale_linear: 1.0
+    scale_angular_drive: 0.62
+    scale_angular_spin: 0.42
+    steer_expo: 1.75
+    steer_expo_spin: 1.9
+    deadzone_spin: 0.05
+    trigger_on: 0.08
+    linear_slew: 5.0
+    linear_brake_slew: 2.5
+    invert_steer: true
+    deadzone: 0.10
+    publish_hz: 40.0

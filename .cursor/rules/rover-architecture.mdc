@@ -1,0 +1,70 @@
+---
+description: Fleet + rover architecture — from WIRING.md and behavior docs
+alwaysApply: true
+---
+
+# Fleet & rover architecture
+
+**Source of truth:** `lego-rover-esp32/WIRING.md`, `lego-rover-ros2/WIRING.md`, `c3-mini-bot/WIRING.md`, `c3-mini-bot/docs/SWARM.md`
+
+## Compute split (current production)
+
+| Robot | Fleet ID | Brain | ESP role | ROS namespace |
+|-------|----------|-------|----------|---------------|
+| **LEGO rover** | bot0 | **dockerhost** (not Pi) | Thin client — motors, IMU, sonar, IR, display, safety | `/rover/…` |
+| **c3-mini** (Roby, etc.) | bot1+ | **dockerhost** `fleet-brain` | Thin client — servos, sonar pan, IMU, IR | `/bot1/…`, `/bot2/…` |
+
+- **Pi is not in the production path** — optional legacy for buzzer/ring only; do not route brain logic through Pi UART.
+- **One micro-ROS agent** on dockerhost (UDP **8888**), multiplexes all ESP clients.
+- **One `cmd_vel` publisher per bot** at a time.
+
+## LEGO rover ESP (T-Display-S3)
+
+**No spare GPIOs** — pan servo is on PCA9685, not a free pin. See `WIRING.md` pin map.
+
+| Bus / pin | Device / role |
+|-----------|---------------|
+| GPIO 1,2,3,10 | Motors L/R via TC78H660 (A=left, B=right) |
+| GPIO 11,12 | HC-SR04 TRIG/ECHO (echo level-shifted) |
+| GPIO 21 | 38 kHz IR chase beacon (for mini-bot TSOP) |
+| I2C 43/44 | MPU6050 **0x68**, MCP front **0x20**, MCP body **0x21**, PCA9685 **0x40** |
+| PCA ch 15 | Pan sonar servo |
+| PCA ch 0 | Aux head servo |
+
+Transport: **WiFi micro-ROS** → dockerhost (`ROVER_MICROROS_WIFI`, agent IP in `platformio.ini`).
+
+## ESP safety priority (rover)
+
+Highest wins — motors are ESP's last word:
+
+1. E-stop (GPIO 0) / low battery
+2. Stall lockout (~4 s)
+3. Sonar hard brake (forward only — brain owns escape)
+4. Front IR cut (if enabled)
+5. Heading hold trim
+6. Brain `/cmd_vel` (dockerhost)
+7. Cmd timeout (400 ms → stop)
+
+**ESP:** smooth pan wiggle, publish range, emergency forward brake only.  
+**Brain:** wander, escape, logging — not an 800-line FSM on the ESP.
+
+## c3-mini-bot (C3 Zero)
+
+- **Direct GPIO servos** (wheels GPIO 0/1, pan GPIO 3) — no PCA9685.
+- MPU6050 on I2C 8/9; sonar GPIO 5/6; TSOP on GPIO 7; beacon TX GPIO 20.
+- `BOT_NAMESPACE` per bot in `platformio_private.ini`.
+
+## Swarm coordination
+
+- Rover **TX beacon** (GPIO21) → mini **RX TSOP** (GPIO7 on pan).
+- Bot-to-bot via ROS topics on dockerhost, not ESP mesh (future: IR pulse patterns, not 38 kHz TSOP).
+
+## Flashing
+
+- Default **OTA** when bot is **stopped** (see `ota-safety.mdc`).
+- Rover: `rover-esp.local` — `s3_tdisplay_microros_rover_ota`
+- Mini: `c3-bot1.local` — `c3_mini_wifi_ota`
+
+## Robot personality
+
+Features belong **in the robot** (firmware + always-on brain), triggered by **Go button**, sensors, or timers — not manual shell scripts. See `robot-personality.mdc`.

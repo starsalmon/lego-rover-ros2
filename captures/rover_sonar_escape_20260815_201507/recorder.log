@@ -1,0 +1,9 @@
+[INFO] [1786788949.530635780] [rover_sonar_escape_recorder]: Sonar escape recorder → /home/cain/rover_sonar_escape_20260815_201507
+[INFO] [1786788962.225576358] [rover_sonar_escape_recorder]: escape #1: esp_turn=+0 best=90° 0.00m front_bins=9 rear=none
+[INFO] [1786788964.770954359] [rover_sonar_escape_recorder]: followup #1: imu left esp straight want left → ok
+[INFO] [1786788992.388824623] [rover_sonar_escape_recorder]: escape #2: esp_turn=+1 best=0° 2.66m front_bins=9 rear=none
+[INFO] [1786788994.989153753] [rover_sonar_escape_recorder]: followup #2: imu right esp right want left → WRONG
+[INFO] [1786789002.587796709] [rover_sonar_escape_recorder]: escape #3: esp_turn=-1 best=180° 0.62m front_bins=9 rear=none
+[INFO] [1786789005.141459642] [rover_sonar_escape_recorder]: followup #3: imu right esp left want left → WRONG
+[INFO] [1786789026.669517591] [rover_sonar_escape_recorder]: escape #4: esp_turn=-1 best=180° 0.61m front_bins=9 rear=none
+[INFO] [1786789029.326569270] [rover_sonar_escape_recorder]: followup #4: imu straight esp left want left → unknown
