@@ -135,6 +135,8 @@ class HallwayFollow:
                 msg.angular.z = self._turn_ang
                 self._last_driving = True
                 return
+            msg.linear.x = -self.cfg.cruise * 0.65
+            self._last_driving = True
             return
 
         if side is None or side_m is None:
