@@ -5,6 +5,7 @@ shape the motors. Escape fires on bump or stall only — not sonar proximity.
 """
 from __future__ import annotations
 
+from collections import deque
 import math
 import os
 import random
@@ -12,8 +13,11 @@ import time
 from enum import Enum, auto
 from typing import Callable
 
+from rover_proximity import ProximityState
+
 # ESP spin-in-place when |linear| < ~0.08 and |angular| > 0.02 — creep forward when steering.
-MIN_LIN_FOR_STEER = 0.11
+# This must be slow (otherwise we "creep-turn" into skirting/legs).
+MIN_LIN_FOR_STEER = 0.06
 
 MIN_DRIVE_SEC = 3.0
 BURST_PROB = 0.01
@@ -29,7 +33,7 @@ FRONT_AVOID_REVERSE_SEC = 1.0
 FRONT_AVOID_STRAIGHT_SEC = 0.40
 FRONT_AVOID_STEER = 0.10
 FRONT_DRIVE_AWAY_SEC = 1.6
-FRONT_DRIVE_AWAY_POWER = 0.22
+FRONT_DRIVE_AWAY_POWER = 0.16
 FRONT_DRIVE_AWAY_STEER = 0.12
 FRONT_CLEAR_HOLD_SEC = 0.40
 FRONT_CLEAR_TIMEOUT_SEC = 2.5
@@ -42,6 +46,10 @@ STRAIGHT_BLOCK_SEC = 10.0
 MAX_ESCAPES_PER_MIN = 3
 ESCAPE_FLOOD_PAUSE_SEC = 10.0
 ARC_YAW_TOL_DEG = 8.0
+
+# Brain-side output slew in open modes (ESP still does per-wheel ramping).
+LIN_SLEW_PER_S = 0.40
+ANG_SLEW_PER_S = 0.90
 
 
 def _noop(*_a, **_k) -> None:
@@ -130,6 +138,13 @@ class Mode(Enum):
     WANDER = auto()
     AVOID = auto()
     ESCAPE = auto()
+    RECOVER = auto()
+
+
+class RecoverPhase(Enum):
+    REVERSE = auto()
+    SCAN = auto()
+    DRIVE_OUT = auto()
 
 
 class EscapePhase(Enum):
@@ -151,6 +166,7 @@ class ExploreController:
         self._speaker = _noop
         self._ring = _noop
         self._bg_radar = None
+        self._proximity = ProximityState()
         self._init_state()
         self._try_bg_radar()
 
@@ -208,6 +224,26 @@ class ExploreController:
         self._imu_gyro_sign = _imu_gyro_sign()
         self._escape_spin_sign = _escape_spin_sign()
         self._last_driving = False
+        self._out_lin = 0.0
+        self._out_ang = 0.0
+        self._scan_until = 0.0
+        self._scan_best_deg = 90.0
+        self._scan_best_m = -1.0
+        self._scan_seen_left = False
+        self._scan_seen_right = False
+        self._scan_started = 0.0
+        self._scan_cooldown_until = 0.0
+
+        # Sonar-brake + oscillation recovery (stops the left-right rotate bounce).
+        self._sonar_avoid_active = False
+        self._sonar_avoid_since = 0.0
+        self._imu_gz_hist: deque[tuple[float, float]] = deque()
+        self._recover_phase = RecoverPhase.REVERSE
+        self._recover_reverse_until = 0.0
+        self._recover_driveout_until = 0.0
+        self._recover_sign = 0.0
+        self._recover_cooldown_until = 0.0
+        self._recover_reason = ""
         self._enter(Mode.CRUISE, random.uniform(4.0, 7.0))
 
     def reset(self) -> None:
@@ -237,14 +273,154 @@ class ExploreController:
     def on_stall(self) -> None:
         self._stall_pending = True
 
+    def on_sonar_avoid(self, active: bool) -> None:
+        """ESP sonar brake active (forward hard-brake)."""
+        now = time.monotonic()
+        active = bool(active)
+        if active and not self._sonar_avoid_active:
+            self._sonar_avoid_since = now
+        if not active:
+            self._sonar_avoid_since = 0.0
+        self._sonar_avoid_active = active
+
+    def on_sonar_range(self, range_m: float) -> None:
+        self._proximity.update_range(range_m)
+        # During a scan, treat incoming range as candidates for the best direction.
+        if self._scan_until > time.monotonic() and not math.isnan(range_m) and range_m > 0.0:
+            # Use the current pan position as the "bearing".
+            try:
+                pan = float(self._proximity._pan_deg)  # internal; ok for this heuristic
+            except Exception:
+                pan = 90.0
+            if range_m > self._scan_best_m:
+                self._scan_best_m = float(range_m)
+                self._scan_best_deg = pan
+
+    def on_pan(self, pan_deg: float) -> None:
+        self._proximity.update_pan(pan_deg)
+        if self._scan_until > time.monotonic():
+            if pan_deg < 20.0:
+                self._scan_seen_left = True
+            elif pan_deg > 160.0:
+                self._scan_seen_right = True
+
+    def wants_cal_sweep(self, now: float) -> bool:
+        return now < self._scan_until
+
+    def _maybe_start_scan(self, now: float) -> None:
+        # Only in open modes; escape remains bump/stall only.
+        if now < self._scan_cooldown_until:
+            return
+        if self.mode in (Mode.ESCAPE, Mode.AVOID, Mode.RECOVER):
+            return
+        # If we're trying to drive forward but the forward cone stays blocked for a bit,
+        # do a quick pan sweep and commit toward the best opening.
+        if self._proximity.persistently_blocked(now, min_s=1.2):
+            self._scan_started = now
+            self._scan_until = now + 3.2  # covers current ESP cal sweep timings
+            self._scan_best_deg = 90.0
+            self._scan_best_m = -1.0
+            self._scan_seen_left = False
+            self._scan_seen_right = False
+            self._scan_cooldown_until = now + 8.0
+            self._log('stuck → quick scan (pan sweep)')
+
+    def on_tof_left(self, range_m: float) -> None:
+        self._proximity.update_tof_left(range_m)
+
+    def on_tof_right(self, range_m: float) -> None:
+        self._proximity.update_tof_right(range_m)
+
     def on_imu(self, gz_rad_s: float) -> None:
         now = time.monotonic()
+        gz = self._imu_gyro_sign * float(gz_rad_s)
         if self._imu_last_mono is not None:
             dt = now - self._imu_last_mono
             if 0.0 < dt < 0.5:
-                self._yaw_integrated += self._imu_gyro_sign * float(gz_rad_s) * dt
+                self._yaw_integrated += gz * dt
         self._imu_last_mono = now
         self._imu_ok = True
+        self._imu_gz_hist.append((now, gz))
+        # Keep a short window for oscillation detection.
+        while self._imu_gz_hist and (now - self._imu_gz_hist[0][0]) > 2.6:
+            self._imu_gz_hist.popleft()
+
+    def _imu_oscillating(self, now: float) -> bool:
+        """Detect back-and-forth rotation (sign-flipping yaw-rate) in a short window."""
+        if now < self._start_time + STARTUP_GRACE_SEC:
+            return False
+        seq: list[int] = []
+        for _t, gz in self._imu_gz_hist:
+            if abs(gz) < 0.18:
+                continue
+            s = 1 if gz > 0.0 else -1
+            if not seq or s != seq[-1]:
+                seq.append(s)
+        flips = max(0, len(seq) - 1)
+        return flips >= 4
+
+    def _close_for_recover(self) -> bool:
+        cfg = self._proximity.cfg
+        fwd = self._proximity.forward_stop_m()
+        if not math.isnan(fwd) and fwd < cfg.sonar_slow_m():
+            return True
+        # Side ToF close.
+        tl = self._proximity._side_clear("left")
+        tr = self._proximity._side_clear("right")
+        if (not math.isnan(tl) and tl < cfg.tof_slow_m()) or (not math.isnan(tr) and tr < cfg.tof_slow_m()):
+            return True
+        # ESP is actively braking forward.
+        if self._sonar_avoid_active:
+            return True
+        return False
+
+    def _start_recover(self, now: float, *, reason: str) -> None:
+        if now < self._recover_cooldown_until:
+            return
+        self._recover_reason = reason
+        self._recover_phase = RecoverPhase.REVERSE
+        self._recover_reverse_until = now + 0.75
+        self._recover_driveout_until = 0.0
+        self._recover_sign = 0.0
+        self.mode = Mode.RECOVER
+        self.mode_until = self._recover_reverse_until
+        self._mode_dur = 0.75
+        self._scan_until = 0.0
+        self._proximity.clear_blocked()
+        self._recover_cooldown_until = now + 7.0
+        self._log(f"recover ({reason}): reverse → scan → drive-out")
+
+    def _tick_recover(self, now: float) -> tuple[float, float]:
+        # Reverse first to give the tail clearance before we turn.
+        if self._recover_phase == RecoverPhase.REVERSE:
+            if now < self._recover_reverse_until:
+                return -min(0.10, _reverse_power()), 0.0
+            # Start scan.
+            self._recover_phase = RecoverPhase.SCAN
+            self._scan_started = now
+            self._scan_until = now + 3.2
+            self._scan_best_deg = 90.0
+            self._scan_best_m = -1.0
+            self._scan_seen_left = False
+            self._scan_seen_right = False
+            return 0.0, 0.0
+
+        if self._recover_phase == RecoverPhase.SCAN:
+            # Scan is handled by `_scan_until` early-return in tick().
+            return 0.0, 0.0
+
+        # DRIVE_OUT: hold a committed arc for a short time.
+        if now < self._recover_driveout_until and self._recover_sign != 0.0:
+            lin = max(0.10, _max_linear() * 0.70)
+            ang = self._recover_sign * min(_max_steer(), 0.12)
+            return lin, ang
+
+        # Done → back to cruise.
+        self._enter(Mode.CRUISE, random.uniform(4.0, 7.0))
+        self._recover_phase = RecoverPhase.REVERSE
+        self._recover_driveout_until = 0.0
+        self._recover_sign = 0.0
+        return self._cruise_speed, self._cruise_curve
 
     def _arc_yaw_turned_deg(self) -> float:
         return abs(math.degrees(self._yaw_integrated - self._arc_yaw_start))
@@ -287,11 +463,18 @@ class ExploreController:
         cap = _max_linear()
         steer = _max_steer()
         if mode == Mode.CRUISE:
-            self._cruise_speed = random.uniform(cap * 0.78, cap)
-            self._cruise_curve = random.choice([-1, 1]) * random.uniform(0.02, steer * 0.45)
+            # Wider spread makes it feel less "one speed".
+            self._cruise_speed = random.uniform(cap * 0.55, cap * 0.92)
+            if random.random() < 0.55:
+                self._cruise_curve = 0.0
+            else:
+                self._cruise_curve = random.choice([-1, 1]) * random.uniform(0.01, steer * 0.28)
         elif mode == Mode.WANDER:
-            self.wander_ang = random.choice([-1, 1]) * random.uniform(0.02, steer * 0.55)
-            self.wander_lin = random.uniform(cap * 0.70, cap * 0.92)
+            if random.random() < 0.25:
+                self.wander_ang = 0.0
+            else:
+                self.wander_ang = random.choice([-1, 1]) * random.uniform(0.01, steer * 0.40)
+            self.wander_lin = random.uniform(cap * 0.40, cap * 0.82)
         elif mode == Mode.BURST:
             self._cruise_curve = random.choice([-1, 1]) * random.uniform(0.02, steer * 0.35)
 
@@ -377,6 +560,8 @@ class ExploreController:
     def _finish_escape_arc(self, now: float) -> None:
         self._event_ignore_until = now + EVENT_COOLDOWN_SEC
         self.straight_block_until = now + STRAIGHT_BLOCK_SEC
+        if self.arc_steer != 0.0:
+            self._proximity.commit_steer_away(1.0 if self.arc_steer > 0.0 else -1.0, 6.0)
         self._enter(Mode.CRUISE, random.uniform(5.0, 9.0))
         self._log('escape done → straight cruise')
 
@@ -399,6 +584,12 @@ class ExploreController:
     def tick(self) -> tuple[float, float]:
         now = time.monotonic()
 
+        # Note intent for stuck detection (before shaping).
+        self._proximity.note_drive_intent(
+            want_forward=self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST, Mode.RECOVER)
+        )
+        self._maybe_start_scan(now)
+
         if _front_ir_stop() and self.mode not in (Mode.ESCAPE, Mode.AVOID):
             if self._front_blocked() and now >= self._ir_front_cooldown_until:
                 self._trigger_front_avoid(now)
@@ -406,12 +597,23 @@ class ExploreController:
         if self._bump_pending or self._stall_pending:
             self._trigger_escape()
 
-        if self.mode not in (Mode.ESCAPE, Mode.AVOID) and now >= self.mode_until:
+        # If we're oscillating (back-and-forth rotation) while close to obstacles,
+        # force a clean recover: reverse → scan → committed drive-out.
+        if self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST) and now >= self._event_ignore_until:
+            if self._imu_oscillating(now) and self._close_for_recover():
+                self._start_recover(now, reason="oscillation")
+
+        if self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST) and now >= self.mode_until:
             self._next_mode()
 
         lin = 0.0
         ang = 0.0
         front_blocked = _front_ir_stop() and self._front_blocked()
+
+        # During scan: stop and let the pan sweep do its thing.
+        if now < self._scan_until:
+            self._sync_bg_radar()
+            return 0.0, 0.0
 
         if self.mode == Mode.CRUISE:
             lin = self._cruise_speed
@@ -430,12 +632,65 @@ class ExploreController:
             lin, ang = self._tick_avoid(now, front_blocked)
         elif self.mode == Mode.ESCAPE:
             lin, ang = self._tick_escape(now, front_blocked)
+        elif self.mode == Mode.RECOVER:
+            lin, ang = self._tick_recover(now)
 
-        if self._bg_radar and self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST):
+        # Tier-1 shaping: slow + steer-away in open room. Never hard-stop here —
+        # ESP owns the forward brake; brain just biases away early.
+        if _sonar_front() and self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST, Mode.RECOVER):
+            lin, ang = self._proximity.apply(lin, ang, max_steer=_max_steer())
+            commit = self._proximity.steer_commit_active(now)
+            if commit != 0.0:
+                ang = max(-_max_steer(), min(_max_steer(), ang + commit * _max_steer() * 0.35))
+
+        if self._bg_radar and self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST, Mode.RECOVER):
             ang += self._bg_radar.steer_bias()
 
         lin, ang = self._apply_front_stop(lin, ang, front_blocked)
         lin, ang = _arc_not_spin(lin, ang)
+
+        # If scan just finished and we saw both sides, commit toward the best opening.
+        if self._scan_until > 0.0 and now >= self._scan_until and (now - self._scan_started) < 6.0:
+            if self._scan_seen_left and self._scan_seen_right:
+                center = self._proximity.cfg.pan_center
+                err = self._scan_best_deg - center
+                sign = 1.0 if err > 6.0 else (-1.0 if err < -6.0 else random.choice([-1.0, 1.0]))
+                self._proximity.commit_steer_away(sign, 3.0)
+                if self.mode == Mode.RECOVER and self._recover_phase == RecoverPhase.SCAN:
+                    self._recover_phase = RecoverPhase.DRIVE_OUT
+                    self._recover_sign = sign
+                    self._recover_driveout_until = now + 2.2
+                    self.mode_until = self._recover_driveout_until
+                    self._mode_dur = 2.2
+                    self._log(
+                        f'scan done → drive-out {"right" if sign > 0 else "left"} '
+                        f'(best {self._scan_best_m:.2f}m @ {self._scan_best_deg:.0f}°)'
+                    )
+                else:
+                    self._enter(Mode.CRUISE, random.uniform(4.0, 6.0))
+                    self._log(
+                        f'scan done → commit {"right" if sign > 0 else "left"} '
+                        f'(best {self._scan_best_m:.2f}m @ {self._scan_best_deg:.0f}°)'
+                    )
+            self._scan_until = 0.0
+
+        # Slew-limit in open modes (not during explicit avoid/escape).
+        if self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST, Mode.RECOVER):
+            dt = 0.05
+            dlin = LIN_SLEW_PER_S * dt
+            dang = ANG_SLEW_PER_S * dt
+            lin = max(self._out_lin - dlin, min(self._out_lin + dlin, lin))
+            ang = max(self._out_ang - dang, min(self._out_ang + dang, ang))
+            self._out_lin = lin
+            self._out_ang = ang
+        else:
+            self._out_lin = lin
+            self._out_ang = ang
+
+        # Avoid pivot-style spins: as we slow down, clamp angular to stay arc-like.
+        if self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST, Mode.RECOVER):
+            max_ang = min(_max_steer(), 0.06 + abs(lin) * 1.05)
+            ang = max(-max_ang, min(max_ang, ang))
 
         if self.mode != Mode.ESCAPE:
             self._driving_linear = lin
@@ -517,4 +772,5 @@ class ExploreController:
 
     def _finish_front_avoid(self, now: float) -> None:
         self._event_ignore_until = now + 1.0
+        self._proximity.commit_steer_away(self.avoid_steer_dir, 4.5)
         self._enter(Mode.CRUISE, random.uniform(4.0, 7.0))

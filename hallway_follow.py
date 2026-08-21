@@ -59,6 +59,7 @@ class HallwayFollow:
     _phase: str = 'cruise'
     _turn_until: float = 0.0
     _turn_ang: float = 0.0
+    _blind_turn_sign: float = 1.0
 
     def update_left(self, meters: float) -> None:
         self._left_m = meters
@@ -122,6 +123,8 @@ class HallwayFollow:
 
         if self._phase == 'turn':
             if now < self._turn_until:
+                # Arc forward lightly (avoid spin-in-place against a wall).
+                msg.linear.x = self.cfg.blind_cruise
                 msg.angular.z = self._turn_ang
                 self._last_driving = True
                 return
@@ -132,10 +135,15 @@ class HallwayFollow:
         if self._fwd_blocked():
             if side is not None:
                 self._start_corner_turn(side, now)
+                msg.linear.x = self.cfg.blind_cruise
                 msg.angular.z = self._turn_ang
                 self._last_driving = True
                 return
+            # Blind dead-end: back up while biasing a turn direction, so we don't
+            # reverse perfectly straight into the same geometry.
             msg.linear.x = -self.cfg.cruise * 0.65
+            msg.angular.z = self._blind_turn_sign * self.cfg.max_ang * 0.55
+            self._blind_turn_sign *= -1.0
             self._last_driving = True
             return
 
@@ -160,7 +168,8 @@ class HallwayFollow:
                     (self._fwd_m - self.cfg.stop_ahead_m)
                     / max(0.05, self.cfg.slow_ahead_m - self.cfg.stop_ahead_m),
                 )
-                lin = self.cfg.cruise * scale
+                # Avoid micro stop/start jitter — keep a tiny crawl until we hit stop_ahead.
+                lin = max(self.cfg.blind_cruise, self.cfg.cruise * scale)
 
         msg.linear.x = lin
         msg.angular.z = ang

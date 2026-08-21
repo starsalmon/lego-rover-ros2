@@ -35,6 +35,7 @@ class RoverBrain(Node):
         self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.session_pub = self.create_publisher(Bool, '/rover/session', 10)
         self.heartbeat_pub = self.create_publisher(UInt32, '/rover/heartbeat', 10)
+        self.sonar_cal_pub = self.create_publisher(Bool, '/rover/sonar/cal_sweep', 10)
 
         self._explore = ExploreController(log=self.get_logger().info)
         self._hallway: HallwayFollow | None = None
@@ -45,6 +46,10 @@ class RoverBrain(Node):
         self._session_active = False
         self._last_session_pub: bool | None = None
         self._pan_deg = float(os.environ.get('PAN_CENTER', '90'))
+        self._cal_last: bool | None = None
+        self._sonar_avoid_active = False
+        self._sonar_avoid_since: float | None = None
+        self._brake_scan_until = 0.0
 
         self.create_subscription(Bool, '/rover/button', self._on_button, 10)
         self.create_subscription(UInt8, '/rover/button_event', self._on_button_event, 10)
@@ -54,6 +59,7 @@ class RoverBrain(Node):
         self.create_subscription(Bool, '/rover/stall', self._on_stall, 10)
         self.create_subscription(Range, '/rover/sonar/range', self._on_range, 10)
         self.create_subscription(Float32, '/rover/sonar/pan_deg', self._on_pan, 10)
+        self.create_subscription(Bool, '/rover/sonar/avoid_active', self._on_sonar_avoid, 10)
         self.create_subscription(Range, '/rover/tof/left', self._on_tof_left, 10)
         self.create_subscription(Range, '/rover/tof/right', self._on_tof_right, 10)
 
@@ -105,7 +111,10 @@ class RoverBrain(Node):
             self.get_logger().info(f'session START ({reason}) — {"wall" if self._wall_follow() else "explore"}')
         else:
             self.get_logger().info(f'session STOP ({reason})')
-            self._publish_stop()
+            try:
+                self._publish_stop()
+            except Exception:
+                pass
         self._publish_session()
 
     def _publish_session(self, *, force: bool = False) -> None:
@@ -129,11 +138,27 @@ class RoverBrain(Node):
             self._set_session(False, 'E-stop long')
 
     def _on_range(self, msg: Range) -> None:
+        rng = float(msg.range)
         if self._wall_follow():
-            self._ensure_hallway().update_forward(float(msg.range), self._pan_deg)
+            self._ensure_hallway().update_forward(rng, self._pan_deg)
+        elif self._session_active:
+            self._explore.on_sonar_range(rng)
 
     def _on_pan(self, msg: Float32) -> None:
         self._pan_deg = float(msg.data)
+        if not self._wall_follow() and self._session_active:
+            self._explore.on_pan(self._pan_deg)
+
+    def _on_sonar_avoid(self, msg: Bool) -> None:
+        active = bool(msg.data)
+        now = self.get_clock().now().nanoseconds / 1e9
+        if active and not self._sonar_avoid_active:
+            self._sonar_avoid_since = now
+        if not active:
+            self._sonar_avoid_since = None
+        self._sonar_avoid_active = active
+        if not self._wall_follow() and self._session_active:
+            self._explore.on_sonar_avoid(active)
 
     def _on_imu(self, msg: Imu) -> None:
         if not self._wall_follow() and self._session_active:
@@ -148,12 +173,18 @@ class RoverBrain(Node):
             self._explore.on_stall()
 
     def _on_tof_left(self, msg: Range) -> None:
+        rng = float(msg.range)
         if self._wall_follow():
-            self._ensure_hallway().update_left(float(msg.range))
+            self._ensure_hallway().update_left(rng)
+        elif self._session_active:
+            self._explore.on_tof_left(rng)
 
     def _on_tof_right(self, msg: Range) -> None:
+        rng = float(msg.range)
         if self._wall_follow():
-            self._ensure_hallway().update_right(float(msg.range))
+            self._ensure_hallway().update_right(rng)
+        elif self._session_active:
+            self._explore.on_tof_right(rng)
 
     def _tick(self) -> None:
         msg = Twist()
@@ -165,6 +196,29 @@ class RoverBrain(Node):
                 msg.linear.x = lin
                 msg.angular.z = ang
         self.pub.publish(msg)
+        self._publish_cal_sweep()
+
+    def _publish_cal_sweep(self) -> None:
+        now = self.get_clock().now().nanoseconds / 1e9
+        want = False
+        if self._session_active:
+            # Primary: explore controller requests scan windows.
+            if not self._wall_follow():
+                want = self._explore.wants_cal_sweep(now)
+
+            # Fallback: if the ESP sonar brake stays active, force a scan.
+            # This fixes cases where we get "wiggle forever" but never trigger cal_sweep.
+            if (not want) and self._sonar_avoid_active and self._sonar_avoid_since is not None:
+                if now - self._sonar_avoid_since >= 0.9 and now >= self._brake_scan_until:
+                    self._brake_scan_until = now + 3.4
+            if now < self._brake_scan_until:
+                want = True
+        if want == self._cal_last:
+            return
+        self._cal_last = want
+        m = Bool()
+        m.data = bool(want)
+        self.sonar_cal_pub.publish(m)
 
     def _send_heartbeat(self) -> None:
         self._heartbeat_n = (self._heartbeat_n + 1) & 0x7FFFFFFF
@@ -193,7 +247,10 @@ def main() -> None:
     finally:
         node._set_session(False, 'shutdown')
         node._explore.shutdown()
-        node._publish_stop()
+        try:
+            node._publish_stop()
+        except Exception:
+            pass
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
