@@ -51,6 +51,10 @@ ARC_YAW_TOL_DEG = 8.0
 LIN_SLEW_PER_S = 0.40
 ANG_SLEW_PER_S = 0.90
 
+# ESP cal_sweep duration (rover_sonar.cpp). Keep in sync so scan windows don’t
+# “do nothing” for multiple seconds.
+CAL_SWEEP_SEC = float(os.environ.get('ROVER_CAL_SWEEP_SEC', '1.9'))
+
 
 def _noop(*_a, **_k) -> None:
     pass
@@ -126,9 +130,10 @@ def _arc_not_spin(lin: float, ang: float) -> tuple[float, float]:
         return lin, ang
     if abs(lin) >= MIN_LIN_FOR_STEER:
         return lin, ang
+    # Preserve sign: never turn a tiny reverse into forward creep.
     creep = MIN_LIN_FOR_STEER if lin >= 0 else -MIN_LIN_FOR_STEER
     if abs(lin) < 0.02:
-        creep = MIN_LIN_FOR_STEER
+        creep = MIN_LIN_FOR_STEER if lin >= 0 else -MIN_LIN_FOR_STEER
     return creep, ang
 
 
@@ -233,6 +238,7 @@ class ExploreController:
         self._scan_seen_right = False
         self._scan_started = 0.0
         self._scan_cooldown_until = 0.0
+        self._last_pan_deg = 90.0
 
         # Sonar-brake + oscillation recovery (stops the left-right rotate bounce).
         self._sonar_avoid_active = False
@@ -286,19 +292,23 @@ class ExploreController:
     def on_sonar_range(self, range_m: float) -> None:
         self._proximity.update_range(range_m)
         # During a scan, treat incoming range as candidates for the best direction.
-        if self._scan_until > time.monotonic() and not math.isnan(range_m) and range_m > 0.0:
-            # Use the current pan position as the "bearing".
-            try:
-                pan = float(self._proximity._pan_deg)  # internal; ok for this heuristic
-            except Exception:
-                pan = 90.0
+        # Note: the ESP cal_sweep can start slightly after we request it; keep
+        # accepting samples for a short grace window beyond `_scan_until`.
+        if (
+            self._scan_until > 0.0
+            and (time.monotonic() - self._scan_started) < 6.0
+            and not math.isnan(range_m)
+            and range_m > 0.0
+        ):
+            pan = float(self._last_pan_deg)
             if range_m > self._scan_best_m:
                 self._scan_best_m = float(range_m)
                 self._scan_best_deg = pan
 
     def on_pan(self, pan_deg: float) -> None:
+        self._last_pan_deg = float(pan_deg)
         self._proximity.update_pan(pan_deg)
-        if self._scan_until > time.monotonic():
+        if self._scan_until > 0.0 and (time.monotonic() - self._scan_started) < 6.0:
             if pan_deg < 20.0:
                 self._scan_seen_left = True
             elif pan_deg > 160.0:
@@ -308,6 +318,10 @@ class ExploreController:
         return now < self._scan_until
 
     def _maybe_start_scan(self, now: float) -> None:
+        # Default: do not scan on "stuck" (it feels like doing nothing).
+        # Recovery + sonar-brake fallback can still request cal_sweep explicitly.
+        if os.environ.get('ROVER_SCAN_ON_STUCK', '0').strip().lower() not in ('1', 'true', 'yes'):
+            return
         # Only in open modes; escape remains bump/stall only.
         if now < self._scan_cooldown_until:
             return
@@ -317,7 +331,7 @@ class ExploreController:
         # do a quick pan sweep and commit toward the best opening.
         if self._proximity.persistently_blocked(now, min_s=1.2):
             self._scan_started = now
-            self._scan_until = now + 3.2  # covers current ESP cal sweep timings
+            self._scan_until = now + CAL_SWEEP_SEC
             self._scan_best_deg = 90.0
             self._scan_best_m = -1.0
             self._scan_seen_left = False
@@ -398,7 +412,10 @@ class ExploreController:
             # Start scan.
             self._recover_phase = RecoverPhase.SCAN
             self._scan_started = now
-            self._scan_until = now + 3.2
+            # The ESP sweep can start ~0.5–1.0s after we request it; give it a
+            # little extra window so we reliably see both sides and don’t get
+            # stuck in SCAN.
+            self._scan_until = now + (CAL_SWEEP_SEC + 0.9)
             self._scan_best_deg = 90.0
             self._scan_best_m = -1.0
             self._scan_seen_left = False
@@ -647,31 +664,45 @@ class ExploreController:
             ang += self._bg_radar.steer_bias()
 
         lin, ang = self._apply_front_stop(lin, ang, front_blocked)
+
+        # If we’re very close in front, never “rotate / creep forward” into the wall.
+        fwd = self._proximity.forward_stop_m()
+        if not math.isnan(fwd):
+            bumper_clear = fwd - self._proximity.cfg.sonar_to_bumper_m
+            if bumper_clear < (self._proximity.cfg.stop_bumper_m + 0.02) and abs(ang) > 0.02:
+                lin = -MIN_LIN_FOR_STEER
+
         lin, ang = _arc_not_spin(lin, ang)
 
         # If scan just finished and we saw both sides, commit toward the best opening.
         if self._scan_until > 0.0 and now >= self._scan_until and (now - self._scan_started) < 6.0:
-            if self._scan_seen_left and self._scan_seen_right:
-                center = self._proximity.cfg.pan_center
+            center = self._proximity.cfg.pan_center
+            if self._scan_best_m > 0.0:
                 err = self._scan_best_deg - center
                 sign = 1.0 if err > 6.0 else (-1.0 if err < -6.0 else random.choice([-1.0, 1.0]))
-                self._proximity.commit_steer_away(sign, 3.0)
-                if self.mode == Mode.RECOVER and self._recover_phase == RecoverPhase.SCAN:
-                    self._recover_phase = RecoverPhase.DRIVE_OUT
-                    self._recover_sign = sign
-                    self._recover_driveout_until = now + 2.2
-                    self.mode_until = self._recover_driveout_until
-                    self._mode_dur = 2.2
-                    self._log(
-                        f'scan done → drive-out {"right" if sign > 0 else "left"} '
-                        f'(best {self._scan_best_m:.2f}m @ {self._scan_best_deg:.0f}°)'
-                    )
-                else:
-                    self._enter(Mode.CRUISE, random.uniform(4.0, 6.0))
-                    self._log(
-                        f'scan done → commit {"right" if sign > 0 else "left"} '
-                        f'(best {self._scan_best_m:.2f}m @ {self._scan_best_deg:.0f}°)'
-                    )
+            else:
+                # If we didn’t capture any scan samples (rare), still exit SCAN.
+                sign = random.choice([-1.0, 1.0])
+
+            self._proximity.commit_steer_away(sign, 3.0)
+            if self.mode == Mode.RECOVER and self._recover_phase == RecoverPhase.SCAN:
+                self._recover_phase = RecoverPhase.DRIVE_OUT
+                self._recover_sign = sign
+                self._recover_driveout_until = now + 2.2
+                self.mode_until = self._recover_driveout_until
+                self._mode_dur = 2.2
+                self._log(
+                    f'scan done → drive-out {"right" if sign > 0 else "left"} '
+                    f'(best {self._scan_best_m:.2f}m @ {self._scan_best_deg:.0f}° '
+                    f'seen L={self._scan_seen_left} R={self._scan_seen_right})'
+                )
+            else:
+                self._enter(Mode.CRUISE, random.uniform(4.0, 6.0))
+                self._log(
+                    f'scan done → commit {"right" if sign > 0 else "left"} '
+                    f'(best {self._scan_best_m:.2f}m @ {self._scan_best_deg:.0f}° '
+                    f'seen L={self._scan_seen_left} R={self._scan_seen_right})'
+                )
             self._scan_until = 0.0
 
         # Slew-limit in open modes (not during explicit avoid/escape).

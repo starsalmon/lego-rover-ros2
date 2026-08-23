@@ -8,6 +8,7 @@ if no drive_mode message has arrived yet.
 from __future__ import annotations
 
 import os
+import time
 
 import rclpy
 from geometry_msgs.msg import Twist
@@ -151,7 +152,7 @@ class RoverBrain(Node):
 
     def _on_sonar_avoid(self, msg: Bool) -> None:
         active = bool(msg.data)
-        now = self.get_clock().now().nanoseconds / 1e9
+        now = time.monotonic()
         if active and not self._sonar_avoid_active:
             self._sonar_avoid_since = now
         if not active:
@@ -199,7 +200,7 @@ class RoverBrain(Node):
         self._publish_cal_sweep()
 
     def _publish_cal_sweep(self) -> None:
-        now = self.get_clock().now().nanoseconds / 1e9
+        now = time.monotonic()
         want = False
         if self._session_active:
             # Primary: explore controller requests scan windows.
@@ -210,7 +211,8 @@ class RoverBrain(Node):
             # This fixes cases where we get "wiggle forever" but never trigger cal_sweep.
             if (not want) and self._sonar_avoid_active and self._sonar_avoid_since is not None:
                 if now - self._sonar_avoid_since >= 0.9 and now >= self._brake_scan_until:
-                    self._brake_scan_until = now + 3.4
+                    # Keep in sync with ESP cal_sweep length (see explore_controller.CAL_SWEEP_SEC).
+                    self._brake_scan_until = now + 1.9
             if now < self._brake_scan_until:
                 want = True
         if want == self._cal_last:

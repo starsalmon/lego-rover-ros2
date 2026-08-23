@@ -23,6 +23,7 @@ class HallwayConfig:
     blind_cruise: float = 0.06
     turn_s: float = 7.0
     align_err_m: float = 0.12
+    center_kp: float = 2.2
     # auto | left | right — which wall to hug at target_m
     wall: str = 'auto'
 
@@ -41,6 +42,7 @@ class HallwayConfig:
             blind_cruise=float(os.environ.get('HALLWAY_BLIND_CRUISE', '0.06')),
             turn_s=float(os.environ.get('HALLWAY_TURN_S', '7.0')),
             align_err_m=float(os.environ.get('HALLWAY_ALIGN_ERR_M', '0.12')),
+            center_kp=float(os.environ.get('HALLWAY_CENTER_KP', '2.2')),
             wall=os.environ.get('HALLWAY_WALL', 'auto').strip().lower(),
         )
 
@@ -110,10 +112,13 @@ class HallwayFollow:
         )
 
     def _start_corner_turn(self, side: str, now: float) -> None:
+        # Note: this rover's angular.z convention is flipped vs "standard ROS":
+        # positive = turn RIGHT, negative = turn LEFT.
+        #
         # Hugging left wall at a dead end → turn right (down the hall).
         self._phase = 'turn'
         self._turn_until = now + self.cfg.turn_s
-        self._turn_ang = -self.cfg.max_ang if side == 'left' else self.cfg.max_ang
+        self._turn_ang = self.cfg.max_ang if side == 'left' else -self.cfg.max_ang
 
     def fill_twist(self, msg: Twist) -> None:
         msg.linear.x = 0.0
@@ -130,6 +135,8 @@ class HallwayFollow:
                 return
             self._phase = 'cruise'
 
+        left_ok = self._valid_side(self._left_m, self._left_ts)
+        right_ok = self._valid_side(self._right_m, self._right_ts)
         side, side_m = self._pick_wall()
 
         if self._fwd_blocked():
@@ -147,6 +154,27 @@ class HallwayFollow:
             self._last_driving = True
             return
 
+        # If we can see both walls, center using the left/right difference.
+        if left_ok and right_ok and self.cfg.wall in ('auto', 'center'):
+            err = self._right_m - self._left_m
+            ang = self.cfg.center_kp * err
+            ang = max(-self.cfg.max_ang, min(self.cfg.max_ang, ang))
+
+            lin = self.cfg.cruise
+            if self._fresh(self._fwd_ts) and math.isfinite(self._fwd_m):
+                if self._fwd_m < self.cfg.slow_ahead_m:
+                    scale = max(
+                        0.0,
+                        (self._fwd_m - self.cfg.stop_ahead_m)
+                        / max(0.05, self.cfg.slow_ahead_m - self.cfg.stop_ahead_m),
+                    )
+                    lin = max(self.cfg.blind_cruise, self.cfg.cruise * scale)
+
+            msg.linear.x = lin
+            msg.angular.z = ang
+            self._last_driving = lin > 0.02 or abs(ang) > 0.02
+            return
+
         if side is None or side_m is None:
             msg.linear.x = self.cfg.blind_cruise
             self._last_driving = True
@@ -154,7 +182,8 @@ class HallwayFollow:
 
         err = side_m - self.cfg.target_m
         ang = self.cfg.kp * err
-        if side == 'right':
+        # Positive = turn RIGHT, negative = turn LEFT.
+        if side == 'left':
             ang = -ang
         ang = max(-self.cfg.max_ang, min(self.cfg.max_ang, ang))
 
