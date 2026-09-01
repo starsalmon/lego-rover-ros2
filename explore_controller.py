@@ -47,9 +47,9 @@ MAX_ESCAPES_PER_MIN = 3
 ESCAPE_FLOOD_PAUSE_SEC = 10.0
 ARC_YAW_TOL_DEG = 8.0
 
-# Brain-side output slew in open modes (ESP still does per-wheel ramping).
+# Brain-side output slew — always on. ESP still ramps wheels in time.
 LIN_SLEW_PER_S = 0.40
-ANG_SLEW_PER_S = 0.90
+ANG_SLEW_PER_S = 0.28
 
 # ESP cal_sweep duration (rover_sonar.cpp). Keep in sync so scan windows don’t
 # “do nothing” for multiple seconds.
@@ -627,12 +627,11 @@ class ExploreController:
         ang = 0.0
         front_blocked = _front_ir_stop() and self._front_blocked()
 
-        # During scan: stop and let the pan sweep do its thing.
+        # During scan: coast to stop (slew below) and let the pan sweep.
         if now < self._scan_until:
             self._sync_bg_radar()
-            return 0.0, 0.0
-
-        if self.mode == Mode.CRUISE:
+            lin, ang = 0.0, 0.0
+        elif self.mode == Mode.CRUISE:
             lin = self._cruise_speed
             ang = self._cruise_curve
         elif self.mode == Mode.BURST:
@@ -652,27 +651,34 @@ class ExploreController:
         elif self.mode == Mode.RECOVER:
             lin, ang = self._tick_recover(now)
 
+        scanning = now < self._scan_until
+
         # Tier-1 shaping: slow + steer-away in open room. Never hard-stop here —
         # ESP owns the forward brake; brain just biases away early.
-        if _sonar_front() and self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST, Mode.RECOVER):
+        if (not scanning) and _sonar_front() and self.mode in (
+            Mode.CRUISE, Mode.WANDER, Mode.BURST, Mode.RECOVER
+        ):
             lin, ang = self._proximity.apply(lin, ang, max_steer=_max_steer())
             commit = self._proximity.steer_commit_active(now)
             if commit != 0.0:
                 ang = max(-_max_steer(), min(_max_steer(), ang + commit * _max_steer() * 0.35))
 
-        if self._bg_radar and self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST, Mode.RECOVER):
+        if (not scanning) and self._bg_radar and self.mode in (
+            Mode.CRUISE, Mode.WANDER, Mode.BURST, Mode.RECOVER
+        ):
             ang += self._bg_radar.steer_bias()
 
-        lin, ang = self._apply_front_stop(lin, ang, front_blocked)
+        if not scanning:
+            lin, ang = self._apply_front_stop(lin, ang, front_blocked)
 
-        # If we’re very close in front, never “rotate / creep forward” into the wall.
-        fwd = self._proximity.forward_stop_m()
-        if not math.isnan(fwd):
-            bumper_clear = fwd - self._proximity.cfg.sonar_to_bumper_m
-            if bumper_clear < (self._proximity.cfg.stop_bumper_m + 0.02) and abs(ang) > 0.02:
-                lin = -MIN_LIN_FOR_STEER
+            # If we’re very close in front, never “rotate / creep forward” into the wall.
+            fwd = self._proximity.forward_stop_m()
+            if not math.isnan(fwd):
+                bumper_clear = fwd - self._proximity.cfg.sonar_to_bumper_m
+                if bumper_clear < (self._proximity.cfg.stop_bumper_m + 0.02) and abs(ang) > 0.02:
+                    lin = -MIN_LIN_FOR_STEER
 
-        lin, ang = _arc_not_spin(lin, ang)
+            lin, ang = _arc_not_spin(lin, ang)
 
         # If scan just finished and we saw both sides, commit toward the best opening.
         if self._scan_until > 0.0 and now >= self._scan_until and (now - self._scan_started) < 6.0:
@@ -705,18 +711,21 @@ class ExploreController:
                 )
             self._scan_until = 0.0
 
-        # Slew-limit in open modes (not during explicit avoid/escape).
-        if self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST, Mode.RECOVER):
-            dt = 0.05
-            dlin = LIN_SLEW_PER_S * dt
-            dang = ANG_SLEW_PER_S * dt
-            lin = max(self._out_lin - dlin, min(self._out_lin + dlin, lin))
-            ang = max(self._out_ang - dang, min(self._out_ang + dang, ang))
-            self._out_lin = lin
-            self._out_ang = ang
-        else:
-            self._out_lin = lin
-            self._out_ang = ang
+        # Always slew, including escape/avoid/scan. Skipping slew is how jerk
+        # and the left/right waggle come back after a "perfect" week.
+        dt = 0.05
+        dlin = LIN_SLEW_PER_S * dt
+        dang = ANG_SLEW_PER_S * dt
+        lin_tgt = lin
+        ang_tgt = ang
+        if self._out_lin * lin < 0.0 and abs(self._out_lin) > 0.03:
+            lin_tgt = 0.0
+        if self._out_ang * ang < 0.0 and abs(self._out_ang) > 0.02:
+            ang_tgt = 0.0
+        lin = max(self._out_lin - dlin, min(self._out_lin + dlin, lin_tgt))
+        ang = max(self._out_ang - dang, min(self._out_ang + dang, ang_tgt))
+        self._out_lin = lin
+        self._out_ang = ang
 
         # Avoid pivot-style spins: as we slow down, clamp angular to stay arc-like.
         if self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST, Mode.RECOVER):
@@ -727,6 +736,8 @@ class ExploreController:
             self._driving_linear = lin
         lin = _cap_linear(lin, burst=self.mode == Mode.BURST)
         ang = _cap_angular(ang)
+        self._out_lin = lin
+        self._out_ang = ang
         self._last_driving = lin > 0.05
         self._sync_bg_radar()
         return lin, ang

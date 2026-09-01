@@ -18,10 +18,10 @@ def _env_float(name: str, default: float) -> float:
 class CmdVelSlew:
     """Slew-filter for normalized linear.x / angular.z cmd_vel."""
 
-    lin_accel: float = 4.0
-    lin_brake: float = 6.0
-    ang_accel: float = 2.8
-    ang_brake: float = 4.5
+    lin_accel: float = 0.45
+    lin_brake: float = 0.80
+    ang_accel: float = 0.28
+    ang_brake: float = 0.45
     rest_eps: float = 0.012
     lin_out: float = 0.0
     ang_out: float = 0.0
@@ -29,10 +29,10 @@ class CmdVelSlew:
     @classmethod
     def from_env(cls) -> CmdVelSlew:
         return cls(
-            lin_accel=_env_float('CMD_SLEW_LIN_ACCEL', 4.0),
-            lin_brake=_env_float('CMD_SLEW_LIN_BRAKE', 6.0),
-            ang_accel=_env_float('CMD_SLEW_ANG_ACCEL', 2.8),
-            ang_brake=_env_float('CMD_SLEW_ANG_BRAKE', 4.5),
+            lin_accel=_env_float('CMD_SLEW_LIN_ACCEL', 0.45),
+            lin_brake=_env_float('CMD_SLEW_LIN_BRAKE', 0.80),
+            ang_accel=_env_float('CMD_SLEW_ANG_ACCEL', 0.28),
+            ang_brake=_env_float('CMD_SLEW_ANG_BRAKE', 0.45),
         )
 
     def reset(self) -> None:
@@ -73,11 +73,9 @@ class CmdVelSlew:
         ) else self.lin_accel
         self.lin_out = self._slew_scalar(self.lin_out, lin_eff, dt, lin_rate)
 
-        spin_flip = abs(lin_eff) < 0.06 and abs(ang_tgt) > 0.04
-        ang_opposite = (self.ang_out > 0.04 and ang_tgt < -0.04) or (
-            self.ang_out < -0.04 and ang_tgt > 0.04
-        )
-        ang_eff = 0.0 if (spin_flip and ang_opposite) else ang_tgt
+        ang_opposite = self.ang_out * ang_tgt < 0.0 and abs(self.ang_out) > 0.005
+        # Always bleed through zero on a sign flip — never snap left↔right.
+        ang_eff = 0.0 if ang_opposite else ang_tgt
         ang_rate = self.ang_brake if (
             hard_stop or ang_opposite or abs(ang_eff) < abs(self.ang_out)
         ) else self.ang_accel

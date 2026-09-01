@@ -18,6 +18,8 @@ from std_msgs.msg import Bool, Float32, UInt8, UInt32
 
 from explore_controller import ExploreController
 from hallway_follow import HallwayConfig, HallwayFollow
+from rover_qos import CMD_VEL_QOS
+from cmd_vel_slew import CmdVelSlew
 
 BTN_ESTOP_LONG = 3
 DRIVE_EXPLORE = 0
@@ -33,7 +35,7 @@ class RoverBrain(Node):
         default_drive = DRIVE_WALL if env_mode == 'hallway' else DRIVE_EXPLORE
         super().__init__('rover_brain')
 
-        self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.pub = self.create_publisher(Twist, '/cmd_vel', CMD_VEL_QOS)
         self.session_pub = self.create_publisher(Bool, '/rover/session', 10)
         self.heartbeat_pub = self.create_publisher(UInt32, '/rover/heartbeat', 10)
         self.sonar_cal_pub = self.create_publisher(Bool, '/rover/sonar/cal_sweep', 10)
@@ -51,6 +53,8 @@ class RoverBrain(Node):
         self._sonar_avoid_active = False
         self._sonar_avoid_since: float | None = None
         self._brake_scan_until = 0.0
+        self._slew = CmdVelSlew.from_env()
+        self._slew_t = time.monotonic()
 
         self.create_subscription(Bool, '/rover/button', self._on_button, 10)
         self.create_subscription(UInt8, '/rover/button_event', self._on_button_event, 10)
@@ -109,6 +113,8 @@ class RoverBrain(Node):
                 self._hallway = HallwayFollow(HallwayConfig.from_env())
             else:
                 self._explore.reset()
+            self._slew.reset()
+            self._slew_t = time.monotonic()
             self.get_logger().info(f'session START ({reason}) — {"wall" if self._wall_follow() else "explore"}')
         else:
             self.get_logger().info(f'session STOP ({reason})')
@@ -196,6 +202,19 @@ class RoverBrain(Node):
                 lin, ang = self._explore.tick()
                 msg.linear.x = lin
                 msg.angular.z = ang
+        now = time.monotonic()
+        dt = now - self._slew_t
+        self._slew_t = now
+        if dt <= 0.0 or dt > 0.2:
+            dt = self.TICK
+        lin, ang = self._slew.step(
+            float(msg.linear.x),
+            float(msg.angular.z),
+            dt,
+            hard_stop=not self._session_active,
+        )
+        msg.linear.x = lin
+        msg.angular.z = ang
         self.pub.publish(msg)
         self._publish_cal_sweep()
 
