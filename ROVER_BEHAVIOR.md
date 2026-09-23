@@ -16,7 +16,7 @@ Pi stack: `autonomous_explore.py`, `rover_radar.py`, `go_auto.sh`
 
 **The Pi publishes motion. The ESP is the last word on whether the wheels spin.**
 
-`autonomous_explore.py` sets cruise and escape via `/cmd_vel`. The ESP applies E-stop, battery, stall lockout, and **immediate forward brake** when sonar shows an imminent hit. Full escape (reverse, spin, drive-out) runs on the Pi.
+`autonomous_explore.py` sets cruise and escape via `/cmd_vel`. The ESP applies E-stop, battery, stall lockout, and **immediate reverse brake** when the **aft** sonar shows an imminent hit. Nose is VL53L8CX / front IR. Full escape runs on dockerhost.
 
 ---
 
@@ -27,7 +27,7 @@ Pi stack: `autonomous_explore.py`, `rover_radar.py`, `go_auto.sh`
 | **1** | **E-stop** (BOOT button held, GPIO 0) | Motors off every loop |
 | **2** | **Low battery** (ADC on ESP) | Same as E-stop |
 | **3** | **Stall lockout** (4 s after ESP stall) | `drive_blocked()` — motors off |
-| **4** | **Sonar hard brake** (ESP) | Zeros forward `cmd_vel` when too close or closing fast — Pi still steers |
+| **4** | **Sonar hard brake** (ESP) | Zeros **reverse** `cmd_vel` when the aft cone is too close |
 | **5** | **Front IR cut** (ESP, when not braking) | Zeros forward if front beam tripped |
 | **6** | **Heading hold** (ESP IMU) | Small trim to keep straight |
 | **7** | **Pi `/cmd_vel`** | Teleop, autonomous explore, capture scripts |
@@ -49,13 +49,13 @@ Each iteration when micro-ROS is connected (~5–10 ms):
 
 ```
 1. E-stop / battery        → force_stop if bad
-2. sonar.tick()            → may zero forward lin (hard brake only)
+2. sonar.tick()            → may zero reverse lin (aft hard brake only)
 3. apply_drive()           → commands motors (respects drive_blocked)
 4. motion.update()         → bump / stall detection (IMU + wheel ticks)
 5. on stall                → force_stop("stall"), 4 s lockout
 ```
 
-Pan sonar uses a smooth ±12° sine wiggle during cruise. No 180° sit-and-scan on the ESP.
+Pan sonar (tail, 180° rotate) uses a ±70° sine sweep around aft during cruise. No 180° sit-and-scan on the ESP. Aux head servo is gone.
 
 ---
 
@@ -153,13 +153,19 @@ Sudden **horizontal** jerk while driving → Pi chime/ring only. **No motor cut,
 
 ---
 
-## ESP: front IR (MCP23008)
+## ESP: front / rear IR (MCP23008)
 
-When `ROVER_DISABLE_FRONT_IR` is **not** set: front beam hit while not reversing → zero forward command.
+Custom front bumper (L/R, very close, angle vs head-on) and rear aux IR.
 
-**Rover production:** front IR disabled in firmware (`ROVER_DISABLE_FRONT_IR=1`); sonar handles front. Aux/rear IR still via `rover_esp_bridge` on Pi.
+Firmware `tick()` continuously pulses emitters **off then on** and uses the **delta** (on && !off) — sunlight rejection and lower average LED power.
 
-Front IR cut is **skipped** while `sonar_drive_override` is true.
+- Front hit while not reversing → zero forward (`apply_drive`).
+- Rear hit while reversing → zero reverse.
+- Topics: `/rover/ir/front` (Bool, any front), `/rover/ir/hits` (UInt8 bits FL/FR/rear).
+
+Brain uses hits alongside sonar (sonar does not disable the bumper). Angled L-only or R-only hit peels away from that side. Rear hit aborts a reverse.
+
+Front IR cut is **skipped** while `sonar_drive_override` is true (ESP-owned sonar manoeuvre). Rear cut still applies.
 
 ---
 

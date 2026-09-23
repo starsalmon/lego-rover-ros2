@@ -99,9 +99,7 @@ def _imu_gyro_sign() -> float:
 
 
 def _front_ir_stop() -> bool:
-    if os.environ.get('ROVER_SONAR', '1').strip().lower() in ('1', 'yes', 'true'):
-        return False
-    return os.environ.get('ROVER_IR_FRONT_STOP', '0').strip().lower() not in (
+    return os.environ.get('ROVER_IR_FRONT_STOP', '1').strip().lower() not in (
         '0',
         'no',
         'false',
@@ -109,7 +107,11 @@ def _front_ir_stop() -> bool:
 
 
 def _sonar_front() -> bool:
-    return os.environ.get('ROVER_SONAR', '1').strip().lower() in ('1', 'yes', 'true')
+    return os.environ.get('ROVER_FRONT_TOF', '1').strip().lower() not in (
+        '0',
+        'no',
+        'false',
+    )
 
 
 def _auto_tick() -> float:

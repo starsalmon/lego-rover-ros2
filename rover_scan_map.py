@@ -89,8 +89,8 @@ def forward_led(n: int) -> int:
 
 
 def front_pan_to_bearing(pan_deg: float, center: float = 90.0) -> float:
-    """Front sonar pan: 0=right, center=forward, 180=left — shortest arc through forward."""
-    return (center - pan_deg) % 360.0
+    """Legacy name. Pan now faces aft: 0=right, 90=back, 180=left."""
+    return (center - pan_deg + 180.0) % 360.0
 
 
 def front_pan_to_led(pan_deg: float, n: int, *, center: float = 90.0, mirror: bool = False) -> int:

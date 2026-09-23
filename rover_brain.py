@@ -7,6 +7,7 @@ if no drive_mode message has arrived yet.
 """
 from __future__ import annotations
 
+import math
 import os
 import time
 
@@ -53,8 +54,15 @@ class RoverBrain(Node):
         self._sonar_avoid_active = False
         self._sonar_avoid_since: float | None = None
         self._brake_scan_until = 0.0
+        self._brake_scan_cooldown_until = 0.0
         self._slew = CmdVelSlew.from_env()
         self._slew_t = time.monotonic()
+        self._front_c = float('nan')
+        self._front_l = float('nan')
+        self._front_r = float('nan')
+
+        self._allow_drive = True
+        self.create_subscription(Bool, '/fleet/allow_drive', self._on_allow_drive, 10)
 
         self.create_subscription(Bool, '/rover/button', self._on_button, 10)
         self.create_subscription(UInt8, '/rover/button_event', self._on_button_event, 10)
@@ -67,6 +75,10 @@ class RoverBrain(Node):
         self.create_subscription(Bool, '/rover/sonar/avoid_active', self._on_sonar_avoid, 10)
         self.create_subscription(Range, '/rover/tof/left', self._on_tof_left, 10)
         self.create_subscription(Range, '/rover/tof/right', self._on_tof_right, 10)
+        self.create_subscription(Range, '/rover/tof/front', self._on_tof_front, 10)
+        self.create_subscription(Range, '/rover/tof/front_left', self._on_tof_front_left, 10)
+        self.create_subscription(Range, '/rover/tof/front_right', self._on_tof_front_right, 10)
+        self.create_subscription(UInt8, '/rover/ir/hits', self._on_ir_hits, 10)
 
         self.create_timer(self.TICK, self._tick)
         self.create_timer(self.HEARTBEAT_PERIOD, self._send_heartbeat)
@@ -132,8 +144,20 @@ class RoverBrain(Node):
         self.session_pub.publish(msg)
         self._last_session_pub = self._session_active
 
+    def _on_allow_drive(self, msg: Bool) -> None:
+        allow = bool(msg.data)
+        if allow == self._allow_drive:
+            return
+        self._allow_drive = allow
+        if not allow and self._session_active:
+            self._set_session(False, 'HA stop all')
+        self.get_logger().info(f'allow_drive={allow}')
+
     def _on_button(self, msg: Bool) -> None:
         if not msg.data:
+            return
+        if not self._allow_drive:
+            self.get_logger().info('Go ignored — wall panel halt (Allow drive is off)')
             return
         if self._session_active:
             self._set_session(False, 'Go tap')
@@ -147,8 +171,8 @@ class RoverBrain(Node):
     def _on_range(self, msg: Range) -> None:
         rng = float(msg.range)
         if self._wall_follow():
-            self._ensure_hallway().update_forward(rng, self._pan_deg)
-        elif self._session_active:
+            return
+        if self._session_active:
             self._explore.on_sonar_range(rng)
 
     def _on_pan(self, msg: Float32) -> None:
@@ -193,6 +217,37 @@ class RoverBrain(Node):
         elif self._session_active:
             self._explore.on_tof_right(rng)
 
+    def _push_front_tof(self) -> None:
+        if self._wall_follow():
+            vals = [
+                v for v in (self._front_c, self._front_l, self._front_r)
+                if math.isfinite(v) and v > 0.02
+            ]
+            if vals:
+                self._ensure_hallway().update_front(min(vals))
+            return
+        if self._session_active:
+            self._explore.on_tof_front(self._front_c, self._front_l, self._front_r)
+
+    def _on_tof_front(self, msg: Range) -> None:
+        self._front_c = float(msg.range)
+        self._push_front_tof()
+
+    def _on_tof_front_left(self, msg: Range) -> None:
+        self._front_l = float(msg.range)
+        self._push_front_tof()
+
+    def _on_tof_front_right(self, msg: Range) -> None:
+        self._front_r = float(msg.range)
+        self._push_front_tof()
+
+    def _on_ir_hits(self, msg: UInt8) -> None:
+        bits = int(msg.data)
+        if self._wall_follow():
+            self._ensure_hallway().update_ir_hits(bits)
+        elif self._session_active:
+            self._explore.on_ir_hits(bits)
+
     def _tick(self) -> None:
         msg = Twist()
         if self._session_active:
@@ -226,14 +281,8 @@ class RoverBrain(Node):
             if not self._wall_follow():
                 want = self._explore.wants_cal_sweep(now)
 
-            # Fallback: if the ESP sonar brake stays active, force a scan.
-            # This fixes cases where we get "wiggle forever" but never trigger cal_sweep.
-            if (not want) and self._sonar_avoid_active and self._sonar_avoid_since is not None:
-                if now - self._sonar_avoid_since >= 0.9 and now >= self._brake_scan_until:
-                    # Keep in sync with ESP cal_sweep length (see explore_controller.CAL_SWEEP_SEC).
-                    self._brake_scan_until = now + 1.9
-            if now < self._brake_scan_until:
-                want = True
+            # Rear sonar avoid must not trigger a sit-and-scan. The tail is
+            # not a pathfinder; L8 peels the nose.
         if want == self._cal_last:
             return
         self._cal_last = want

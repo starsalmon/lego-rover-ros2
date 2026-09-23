@@ -236,8 +236,8 @@ def cruise_steer_bias(hits: list[bool]) -> float:
             right_score += 1.0
         elif 225.0 <= bearing <= 315.0:
             left_score += 1.0
-    # Blocked right → steer left (negative); blocked left → steer right.
-    return gain * (left_score - right_score)
+    # Blocked right → turn left (+); blocked left → turn right (−).
+    return gain * (right_score - left_score)
 
 
 def wall_servo_angle(side: str | None = None) -> float:
