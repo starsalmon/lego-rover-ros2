@@ -15,7 +15,7 @@ import rclpy
 from geometry_msgs.msg import Twist
 from rclpy.node import Node
 from sensor_msgs.msg import Imu, Range
-from std_msgs.msg import Bool, Float32, UInt8, UInt32
+from std_msgs.msg import Bool, Float32, Float32MultiArray, UInt8, UInt32
 
 from explore_controller import ExploreController
 from hallway_follow import HallwayConfig, HallwayFollow
@@ -60,6 +60,7 @@ class RoverBrain(Node):
         self._front_c = float('nan')
         self._front_l = float('nan')
         self._front_r = float('nan')
+        self._in_corridor = False
 
         self._allow_drive = True
         self.create_subscription(Bool, '/fleet/allow_drive', self._on_allow_drive, 10)
@@ -78,6 +79,7 @@ class RoverBrain(Node):
         self.create_subscription(Range, '/rover/tof/front', self._on_tof_front, 10)
         self.create_subscription(Range, '/rover/tof/front_left', self._on_tof_front_left, 10)
         self.create_subscription(Range, '/rover/tof/front_right', self._on_tof_front_right, 10)
+        self.create_subscription(Float32MultiArray, '/rover/tof/l8_cols', self._on_l8_cols, 10)
         self.create_subscription(UInt8, '/rover/ir/hits', self._on_ir_hits, 10)
 
         self.create_timer(self.TICK, self._tick)
@@ -205,27 +207,19 @@ class RoverBrain(Node):
 
     def _on_tof_left(self, msg: Range) -> None:
         rng = float(msg.range)
-        if self._wall_follow():
-            self._ensure_hallway().update_left(rng)
-        elif self._session_active:
+        self._ensure_hallway().update_left(rng)
+        if self._session_active:
             self._explore.on_tof_left(rng)
 
     def _on_tof_right(self, msg: Range) -> None:
         rng = float(msg.range)
-        if self._wall_follow():
-            self._ensure_hallway().update_right(rng)
-        elif self._session_active:
+        self._ensure_hallway().update_right(rng)
+        if self._session_active:
             self._explore.on_tof_right(rng)
 
     def _push_front_tof(self) -> None:
-        if self._wall_follow():
-            vals = [
-                v for v in (self._front_c, self._front_l, self._front_r)
-                if math.isfinite(v) and v > 0.02
-            ]
-            if vals:
-                self._ensure_hallway().update_front(min(vals))
-            return
+        if math.isfinite(self._front_c) and self._front_c > 0.02:
+            self._ensure_hallway().update_front(self._front_c)
         if self._session_active:
             self._explore.on_tof_front(self._front_c, self._front_l, self._front_r)
 
@@ -241,6 +235,10 @@ class RoverBrain(Node):
         self._front_r = float(msg.range)
         self._push_front_tof()
 
+    def _on_l8_cols(self, msg: Float32MultiArray) -> None:
+        cols = [float(v) for v in msg.data]
+        self._explore.on_l8_cols(cols)
+
     def _on_ir_hits(self, msg: UInt8) -> None:
         bits = int(msg.data)
         if self._wall_follow():
@@ -255,6 +253,18 @@ class RoverBrain(Node):
                 self._ensure_hallway().fill_twist(msg)
             else:
                 lin, ang = self._explore.tick()
+                in_hall = self._explore.react_corridor()
+                if in_hall:
+                    self._explore.leave_recover_for_hallway()
+                    hw = Twist()
+                    self._ensure_hallway().fill_twist(hw)
+                    lin, ang = hw.linear.x, hw.angular.z
+                if in_hall != self._in_corridor:
+                    self._in_corridor = in_hall
+                    if in_hall:
+                        self.get_logger().info('hallway: existing center — steer off the closer wall, no reverse')
+                    else:
+                        self.get_logger().info('hallway: walls gone — back to explore')
                 msg.linear.x = lin
                 msg.angular.z = ang
         now = time.monotonic()

@@ -27,9 +27,8 @@ alwaysApply: true
 | GPIO 1,2,3,10 | Motors L/R via TC78H660 (A=left, B=right) |
 | GPIO 11,12 | HC-SR04 TRIG/ECHO (echo level-shifted) |
 | GPIO 21 | 38 kHz IR chase beacon (for mini-bot TSOP) |
-| I2C 43/44 | MPU6050 **0x68**, MCP front **0x20**, MCP body **0x21**, PCA9685 **0x40** |
-| PCA ch 15 | Pan sonar servo |
-| PCA ch 0 | Aux head servo |
+| I2C 43/44 | MPU6050 **0x68**, MCP **0x21**, PCA9685 **0x40**, VL53L1X **0x30/0x31**, VL53L8CX **0x29** |
+| PCA ch 0 | Rear pan sonar servo |
 
 Transport: **WiFi micro-ROS** → dockerhost (`ROVER_MICROROS_WIFI`, agent IP in `platformio.ini`).
 
@@ -39,8 +38,8 @@ Highest wins — motors are ESP's last word:
 
 1. E-stop (GPIO 0) / low battery
 2. Stall lockout (~4 s)
-3. Sonar hard brake (forward only — brain owns escape)
-4. Front IR cut (if enabled)
+3. Sonar hard brake (reverse / aft only — brain owns escape)
+4. L8 nose brake (forward)
 5. Heading hold trim
 6. Brain `/cmd_vel` (dockerhost)
 7. Cmd timeout (400 ms → stop)

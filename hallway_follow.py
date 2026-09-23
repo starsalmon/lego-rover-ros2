@@ -66,6 +66,8 @@ class HallwayFollow:
     _ir_fr: bool = False
     _ir_rear: bool = False
     _ir_hits_at: float = 0.0
+    _side_prev: tuple[float, float, float] | None = None
+    _ang_filt: float = 0.0
 
     def update_left(self, meters: float) -> None:
         self._left_m = meters
@@ -97,7 +99,7 @@ class HallwayFollow:
         return (time.monotonic() - self._ir_hits_at) < 0.30
 
     def _front_ir(self) -> bool:
-        return self._ir_fresh() and (self._ir_fl or self._ir_fr)
+        return False
 
     def _rear_ir(self) -> bool:
         return self._ir_fresh() and self._ir_rear
@@ -144,6 +146,40 @@ class HallwayFollow:
         self._turn_until = now + self.cfg.turn_s
         self._turn_ang = -self.cfg.max_ang if side == 'left' else self.cfg.max_ang
 
+    def fill_corridor_reaction(self, msg: Twist) -> bool:
+        """Drive straight between two walls. Nudge away only if a hip is close.
+
+        Do not equalize left/right ToF — yaw makes the outside sensor read
+        longer and that used to steer harder into the wall.
+        """
+        msg.linear.x = 0.0
+        msg.angular.z = 0.0
+        left_ok = self._valid_side(self._left_m, self._left_ts)
+        right_ok = self._valid_side(self._right_m, self._right_ts)
+        if not (left_ok and right_ok):
+            return False
+
+        comfort = 0.38
+        max_ang = 0.04
+        ang = 0.0
+        if self._left_m < comfort:
+            ang -= max_ang * min(1.0, (comfort - self._left_m) / 0.20)
+        if self._right_m < comfort:
+            ang += max_ang * min(1.0, (comfort - self._right_m) / 0.20)
+        ang = max(-max_ang, min(max_ang, ang))
+        if abs(ang) < 0.022:
+            ang = 0.0
+
+        lin = 0.14
+        pinch = min(self._left_m, self._right_m)
+        if pinch < 0.22:
+            lin = 0.11
+
+        msg.linear.x = lin
+        msg.angular.z = ang
+        self._last_driving = lin > 0.02 or abs(ang) > 0.02
+        return True
+
     def fill_twist(self, msg: Twist) -> None:
         msg.linear.x = 0.0
         msg.angular.z = 0.0
@@ -162,6 +198,38 @@ class HallwayFollow:
         left_ok = self._valid_side(self._left_m, self._left_ts)
         right_ok = self._valid_side(self._right_m, self._right_ts)
         side, side_m = self._pick_wall()
+
+        # Both walls: this is the centering that already worked on the bench.
+        # Do not reverse here. A reverse in a hall hits the tail sonar, which
+        # zeros it, and the ESP then drops the turn — the robot just sits.
+        if left_ok and right_ok and self.cfg.wall in ('auto', 'center'):
+            err = self._right_m - self._left_m
+            if abs(err) < 0.04:
+                err = 0.0
+            now_s = time.monotonic()
+            d_term = 0.0
+            if self._side_prev is not None:
+                dt = now_s - self._side_prev[0]
+                if 0.05 <= dt <= 0.8:
+                    d_l = -(self._left_m - self._side_prev[1]) / dt
+                    d_r = -(self._right_m - self._side_prev[2]) / dt
+                    d_term = 0.40 * (max(0.0, d_r) - max(0.0, d_l))
+            self._side_prev = (now_s, self._left_m, self._right_m)
+            raw = -0.55 * err + d_term
+            self._ang_filt = 0.72 * self._ang_filt + 0.28 * raw
+            ang = max(-self.cfg.max_ang, min(self.cfg.max_ang, self._ang_filt))
+            # Below 0.04 the ESP heading-hold stays on and walks into the wall.
+            if abs(err) >= 0.06 and abs(ang) < 0.05:
+                ang = math.copysign(0.05, ang if ang != 0.0 else -err)
+
+            lin = max(0.12, min(self.cfg.cruise, 0.14))
+            pinch = min(self._left_m, self._right_m)
+            if pinch < 0.20:
+                lin = 0.12
+            msg.linear.x = lin
+            msg.angular.z = ang
+            self._last_driving = True
+            return
 
         if self._fwd_blocked():
             if side is not None:
@@ -182,30 +250,8 @@ class HallwayFollow:
             self._last_driving = True
             return
 
-        # If we can see both walls, center using the left/right difference.
-        if left_ok and right_ok and self.cfg.wall in ('auto', 'center'):
-            # More space on the right (err > 0) → turn right (−).
-            err = self._right_m - self._left_m
-            ang = -self.cfg.center_kp * err
-            ang = max(-self.cfg.max_ang, min(self.cfg.max_ang, ang))
-
-            lin = self.cfg.cruise
-            if self._fresh(self._fwd_ts) and math.isfinite(self._fwd_m):
-                if self._fwd_m < self.cfg.slow_ahead_m:
-                    scale = max(
-                        0.0,
-                        (self._fwd_m - self.cfg.stop_ahead_m)
-                        / max(0.05, self.cfg.slow_ahead_m - self.cfg.stop_ahead_m),
-                    )
-                    lin = max(self.cfg.blind_cruise, self.cfg.cruise * scale)
-
-            msg.linear.x = lin
-            msg.angular.z = ang
-            self._last_driving = lin > 0.02 or abs(ang) > 0.02
-            return
-
         if side is None or side_m is None:
-            msg.linear.x = self.cfg.blind_cruise
+            msg.linear.x = 0.12
             self._last_driving = True
             return
 

@@ -1,6 +1,6 @@
 # LEGO Rover — Pi wiring (Raspberry Pi Zero 2W)
 
-Motors, IMU, IR (MCP23008), aux servo (PCA9685), and IR chase beacon are on the **ESP32** — see [`lego-rover-esp32/WIRING.md`](../lego-rover-esp32/WIRING.md).
+Motors, IMU, body MCP23008, pan servo (PCA9685 ch 0), and IR chase beacon are on the **ESP32** — see [`lego-rover-esp32/WIRING.md`](../lego-rover-esp32/WIRING.md).
 
 This doc is **Pi GPIO only**: UART to ESP, buzzer, LED ring, and optional legacy wiring.
 
@@ -9,8 +9,8 @@ This doc is **Pi GPIO only**: UART to ESP, buzzer, LED ring, and optional legacy
 | Setting | Value |
 |---------|--------|
 | `ROVER_BUTTON_SOURCE` | `esp` — Go/E-stop on ESP, not Pi GPIO |
-| `ROVER_IR_SOURCE` | `esp` — front/aux IR on ESP MCP bus |
-| `ROVER_SERVO_SOURCE` | `esp` — aux servo via ESP PCA9685 + `/rover/servo/angle` |
+| `ROVER_IR_SOURCE` | `esp` — wheel IR on body MCP (no front bumper board) |
+| `ROVER_SERVO_SOURCE` | `esp` — rear pan sonar on PCA9685 ch 0 |
 
 Always use **BCM GPIO numbers** in software.
 

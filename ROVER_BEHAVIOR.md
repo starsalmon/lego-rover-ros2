@@ -16,7 +16,7 @@ Pi stack: `autonomous_explore.py`, `rover_radar.py`, `go_auto.sh`
 
 **The Pi publishes motion. The ESP is the last word on whether the wheels spin.**
 
-`autonomous_explore.py` sets cruise and escape via `/cmd_vel`. The ESP applies E-stop, battery, stall lockout, and **immediate reverse brake** when the **aft** sonar shows an imminent hit. Nose is VL53L8CX / front IR. Full escape runs on dockerhost.
+`autonomous_explore.py` sets cruise and escape via `/cmd_vel`. The ESP applies E-stop, battery, stall lockout, and **immediate reverse brake** when the **aft** sonar shows an imminent hit. Nose is VL53L8CX. Full escape runs on dockerhost.
 
 ---
 
@@ -28,7 +28,7 @@ Pi stack: `autonomous_explore.py`, `rover_radar.py`, `go_auto.sh`
 | **2** | **Low battery** (ADC on ESP) | Same as E-stop |
 | **3** | **Stall lockout** (4 s after ESP stall) | `drive_blocked()` — motors off |
 | **4** | **Sonar hard brake** (ESP) | Zeros **reverse** `cmd_vel` when the aft cone is too close |
-| **5** | **Front IR cut** (ESP, when not braking) | Zeros forward if front beam tripped |
+| **5** | **L8 nose brake** (ESP) | Zeros forward if the inner 4×4 is inside 24 cm |
 | **6** | **Heading hold** (ESP IMU) | Small trim to keep straight |
 | **7** | **Pi `/cmd_vel`** | Teleop, autonomous explore, capture scripts |
 | **8** | **Cmd timeout** (400 ms with no fresh `cmd_vel`) | Stop |
@@ -104,6 +104,8 @@ Config in `rover_sonar.cpp` / `rover_sonar.h`.
 - Forward + range &lt; **0.20 m** (`SONAR_STOP_M`): **bias + slow for ~750 ms**, then full escape if still blocked.
 
 **Normal explore** (standalone): wander + bias + escape only when truly stuck. **Capture mode** (legacy Pi scripts) deliberately hunted walls — not used on-robot anymore.
+
+**Hallway is not a mode.** If both hip ToFs see walls, explore holds the gap: mostly straight, nudge off a close/closing hip (must beat ESP heading-hold). Empty L8 (no target) is **not** a clear path. Recover peels away from the closer hip and will not call it clear while a hip is scraped. Front half of the LED ring shows L8 columns (dark = no return).
 
 ### Escape state machine
 

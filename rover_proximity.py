@@ -46,7 +46,7 @@ class ProximityConfig:
     range_stale_s: float = 1.2
     tof_stale_s: float = 1.0
     side_steer_gain: float = 0.85
-    tof_min_valid_m: float = 0.03
+    tof_min_valid_m: float = 0.10
     tof_max_valid_m: float = 2.5
     sonar_faces_rear: bool = True
 
@@ -73,7 +73,7 @@ class ProximityConfig:
             range_stale_s=_f('ROVER_RANGE_STALE_S', 1.2),
             tof_stale_s=_f('ROVER_TOF_STALE_S', 1.0),
             side_steer_gain=_f('ROVER_SIDE_STEER_GAIN', 0.85),
-            tof_min_valid_m=_f('ROVER_TOF_MIN_VALID_M', 0.03),
+            tof_min_valid_m=_f('ROVER_TOF_MIN_VALID_M', 0.10),
             tof_max_valid_m=_f('ROVER_TOF_MAX_VALID_M', 2.5),
             sonar_faces_rear=os.environ.get('ROVER_SONAR_REAR', '1').strip().lower()
             not in ('0', 'no', 'false'),
@@ -116,6 +116,10 @@ class ProximityState:
     _front_ms: float = 0.0
     _tof_l_prev: tuple[float, float] | None = None
     _tof_r_prev: tuple[float, float] | None = None
+    _l8_cols: list[float] = field(default_factory=lambda: [float('nan')] * 8)
+    _l8_cols_ms: float = 0.0
+    _corr_filt: float = 0.0
+    _corridor_seen: float = 0.0
 
     def update_pan(self, pan_deg: float) -> None:
         self._pan_deg = float(pan_deg)
@@ -178,10 +182,28 @@ class ProximityState:
         if not math.isnan(right_m):
             self._front_r = _ok(right_m)
 
+    def update_l8_cols(self, cols: list[float]) -> None:
+        now = time.monotonic()
+        out = [float('nan')] * 8
+        for i, raw in enumerate(cols[:8]):
+            try:
+                v = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(v) and 0.02 < v < 4.0:
+                out[i] = v
+        self._l8_cols = out
+        self._l8_cols_ms = now
+
     def _front_fresh(self, max_age_s: float = 0.5) -> bool:
         return (time.monotonic() - self._front_ms) <= max_age_s
 
     def _front_half(self, side: str) -> float:
+        if self._l8_cols_ms > 0.0 and (time.monotonic() - self._l8_cols_ms) <= 0.6:
+            idxs = (0, 1, 2) if side == 'left' else (5, 6, 7)
+            vals = [self._l8_cols[i] for i in idxs if not math.isnan(self._l8_cols[i])]
+            if vals:
+                return min(vals)
         if not self._front_fresh(0.6):
             return float('nan')
         v = self._front_l if side == 'left' else self._front_r
@@ -189,19 +211,25 @@ class ProximityState:
             return float('nan')
         return v
 
-    def front_min_m(self) -> float:
-        """Closest L8 zone (center or either half) — shallow walls live in a half."""
+    def front_center_m(self) -> float:
+        """Inner 4×4 — used for stop/reverse. Halves are for steer only."""
         if not self._front_fresh():
             return float('nan')
-        vals = [v for v in (self._front_m, self._front_l, self._front_r)
+        return self._front_m
+
+    def front_min_m(self) -> float:
+        """Closest *usable* L8 reading. Ignores floor-looking half cells."""
+        if not self._front_fresh():
+            return float('nan')
+        vals = [v for v in (self._front_m, self._front_half('left'), self._front_half('right'))
                 if not math.isnan(v) and v > 0.02]
         return min(vals) if vals else float('nan')
 
     def front_stop_m(self) -> float:
-        return self.front_min_m()
+        return self.front_center_m()
 
     def front_open(self, min_m: float | None = None) -> bool:
-        fwd = self.front_min_m()
+        fwd = self.front_center_m()
         if math.isnan(fwd):
             return False
         return fwd > (min_m if min_m is not None else self.cfg.l8_slow_m)
@@ -253,21 +281,219 @@ class ProximityState:
             return float('nan')
         return min(vals)
 
+    def along_wall(self) -> bool:
+        """One or both body ToFs see a wall. Hallway, not open room."""
+        for side in ('left', 'right'):
+            v = self._side_clear(side)
+            if not math.isnan(v) and v < 1.05:
+                return True
+        return False
+
+    def in_corridor(self) -> bool:
+        """Both hips see walls. Latch briefly so one VL53 dropout does not flap."""
+        sl = self._side_clear('left')
+        sr = self._side_clear('right')
+        both = (
+            not math.isnan(sl)
+            and not math.isnan(sr)
+            and sl < self.cfg.side_corridor_max_m
+            and sr < self.cfg.side_corridor_max_m
+        )
+        now = time.monotonic()
+        if both:
+            self._corridor_seen = now
+            return True
+        if self._corridor_seen > 0.0 and (now - self._corridor_seen) < 3.0:
+            return True
+        return False
+
+    def wall_dead_end(self) -> bool:
+        """Really boxed in: nose close and both hips tight."""
+        fwd = self.front_center_m()
+        sl = self._side_clear('left')
+        sr = self._side_clear('right')
+        nose = not math.isnan(fwd) and fwd < 0.22
+        hips = (
+            not math.isnan(sl)
+            and not math.isnan(sr)
+            and sl < 0.38
+            and sr < 0.38
+        )
+        return nose and hips
+
+    def must_pivot(self) -> bool:
+        sl = self._side_clear('left')
+        sr = self._side_clear('right')
+        vals = [v for v in (sl, sr) if not math.isnan(v)]
+        if not vals:
+            return False
+        return min(vals) < 0.28
+
+    def repel_steer(self, max_steer: float) -> float:
+        """Always away from the closer hip. Never toward a wall."""
+        sl = self._side_clear('left')
+        sr = self._side_clear('right')
+        if not math.isnan(sl) and not math.isnan(sr):
+            return self.corridor_steer(max_steer)
+        return self.turn_away_from_closest() * max_steer
+
+    def repel_overlay(self, lin: float, ang: float, *, max_steer: float) -> tuple[float, float]:
+        """Last word: do not drive into a wall. Pivot instead of creeping."""
+        sl = self._side_clear('left')
+        sr = self._side_clear('right')
+        vals = [v for v in (sl, sr) if not math.isnan(v)]
+        if not vals:
+            return lin, ang
+        closer = min(vals)
+        if closer < 0.28:
+            # lin=0 makes ESP ignore turn. Reverse+nudge actually moves.
+            return -0.10, self.turn_away_from_closest() * 0.05
+        if self.in_corridor():
+            return lin, ang
+        if self.along_wall() and not math.isnan(sl) and not math.isnan(sr):
+            ang = self.hip_repel(0.04)
+        return lin, ang
+
+    def side_too_close(self) -> bool:
+        stop = self.cfg.tof_stop_m()
+        for side in ('left', 'right'):
+            v = self._side_clear(side)
+            if not math.isnan(v) and v < stop:
+                return True
+        return False
+
+    def hip_repel(self, max_steer: float = 0.05) -> float:
+        """Steer away from a close or closing hip.
+
+        ang=0 lets ESP heading-hold trim up to 0.15 — that walked it into the
+        wall with cmd 0.14,0.00. |ang| must be > 0.04 to disarm heading-hold.
+        """
+        sl = self._side_clear('left')
+        sr = self._side_clear('right')
+        comfort = 0.50
+        ang = 0.0
+        both = not math.isnan(sl) and not math.isnan(sr)
+        # 2–6 cm of noise while both hips are comfortable is not a turn.
+        if both and min(sl, sr) > 0.42 and abs(sl - sr) < 0.08:
+            ang -= 0.03 * min(1.0, self._side_closing('left') / 0.12)
+            ang += 0.03 * min(1.0, self._side_closing('right') / 0.12)
+        else:
+            if not math.isnan(sl):
+                if sl < comfort:
+                    ang -= max_steer * min(1.0, (comfort - sl) / 0.28)
+                ang -= 0.03 * min(1.0, self._side_closing('left') / 0.12)
+            if not math.isnan(sr):
+                if sr < comfort:
+                    ang += max_steer * min(1.0, (comfort - sr) / 0.28)
+                ang += 0.03 * min(1.0, self._side_closing('right') / 0.12)
+        ang = max(-max_steer, min(max_steer, ang))
+        if abs(ang) < 0.012:
+            return 0.0
+        # ESP heading-hold stays on below 0.04 and will fight a weaker nudge.
+        if abs(ang) < 0.045:
+            return math.copysign(0.045, ang)
+        return ang
+
+    def corridor_drive(self, cruise: float) -> tuple[float, float]:
+        """Hallway: hold the gap. Nudge off a closing hip so heading-hold cannot walk in."""
+        lin = max(0.11, min(0.14, cruise))
+        ang = self.hip_repel(0.05)
+        sl = self._side_clear('left')
+        sr = self._side_clear('right')
+        vals = [v for v in (sl, sr) if not math.isnan(v)]
+        if vals and min(vals) < 0.22:
+            lin = min(lin, 0.11)
+        return lin, ang
+
+    def corridor_steer(self, max_steer: float) -> float:
+        return self.hip_repel(min(0.05, max_steer))
+
+    def l8_col_min(self) -> float:
+        if (time.monotonic() - self._l8_cols_ms) > 0.6:
+            return float('nan')
+        vals = [v for v in self._l8_cols if not math.isnan(v)]
+        return min(vals) if vals else float('nan')
+
+    def l8_opening_sign(self) -> float:
+        """+1 left, −1 right, 0 unknown. Uses 8 columns, not inner 4×4."""
+        if (time.monotonic() - self._l8_cols_ms) > 0.6:
+            return 0.0
+        left = [v for v in self._l8_cols[:4] if not math.isnan(v)]
+        right = [v for v in self._l8_cols[4:] if not math.isnan(v)]
+        if not left and not right:
+            return 0.0
+        if not left:
+            return 1.0
+        if not right:
+            return -1.0
+        lv, rv = min(left), min(right)
+        if rv > lv + 0.12:
+            return -1.0
+        if lv > rv + 0.12:
+            return 1.0
+        return 0.0
+
+    def path_clear_to_drive(self) -> bool:
+        """Open space ahead — empty L8 is NOT open (no target ≠ a path)."""
+        fwd = self.front_center_m()
+        if math.isnan(fwd) or fwd < 0.90:
+            return False
+        col = self.l8_col_min()
+        if not math.isnan(col) and col < 0.50:
+            return False
+        sl = self._side_clear('left')
+        sr = self._side_clear('right')
+        hips = [v for v in (sl, sr) if not math.isnan(v)]
+        if hips and min(hips) < 0.38:
+            return False
+        return True
+
+    def l8_gap_steer(self, max_steer: float) -> float:
+        """Steer toward the most open mid-row column. 0 = left, 7 = right."""
+        if (time.monotonic() - self._l8_cols_ms) > 0.6:
+            return 0.0
+        best_i = -1
+        best_v = -1.0
+        worst_v = 99.0
+        for i, v in enumerate(self._l8_cols):
+            if math.isnan(v):
+                continue
+            if v > best_v:
+                best_v = v
+                best_i = i
+            if v < worst_v:
+                worst_v = v
+        if best_i < 0 or best_v < 0.35:
+            return 0.0
+        if worst_v > 1.2 or (best_v - worst_v) < 0.18:
+            return 0.0
+        # col 0 is left (+ang), col 7 is right (−ang).
+        return max(-max_steer, min(max_steer, ((3.5 - best_i) / 3.5) * max_steer))
+
     def is_forward_blocked(self) -> bool:
-        fwd = self.front_min_m()
+        fwd = self.front_center_m()
         if math.isnan(fwd):
             return False
         return fwd < self.cfg.l8_turn_m
 
     def is_nose_jammed(self) -> bool:
-        fwd = self.front_min_m()
-        if math.isnan(fwd):
-            return False
-        return fwd < self.cfg.l8_stop_m
+        """ESP brakes forward at 0.24 m. Must reverse — a zeroed lin also kills turn."""
+        fwd = self.front_center_m()
+        if not math.isnan(fwd) and fwd < 0.26:
+            return True
+        col = self.l8_col_min()
+        if not math.isnan(col) and col < 0.24:
+            return True
+        return False
 
     def wants_early_turn(self) -> bool:
-        """Couch-range: L8 sees it — peel, do not reverse-jog then retry."""
-        fwd = self.front_min_m()
+        """Wall entering the nose FOV — peel before the bumper."""
+        if self.along_wall() or self.in_corridor():
+            col = self.l8_col_min()
+            if not math.isnan(col) and col < 0.40:
+                return True
+            return False
+        fwd = self.front_center_m()
         if math.isnan(fwd):
             return False
         return fwd < self.cfg.l8_turn_m
@@ -359,7 +585,7 @@ class ProximityState:
         if not math.isnan(t):
             vals.append(t)
         if self._front_fresh(0.6):
-            v = self._front_l if side == 'left' else self._front_r
+            v = self._front_half(side)
             if not math.isnan(v) and v > 0.02:
                 vals.append(v)
         if not self.cfg.sonar_faces_rear:
@@ -415,45 +641,33 @@ class ProximityState:
         return 1.0
 
     def live_opening_sign(self) -> tuple[float, bool]:
-        """Pick a peel side from nose L8 + side ToF. Rear sonar is not an opening.
-
-        Returns (sign, confident). +1 = left, −1 = right.
-        """
-        tl = self._side_clear('left')
-        tr = self._side_clear('right')
-        cfg = self.cfg
-        left_m = self._half_clear('left')
-        right_m = self._half_clear('right')
-        sign = 0.0
-        confident = False
-        if math.isnan(left_m) and math.isnan(right_m):
-            return 0.0, False
-        if math.isnan(left_m):
-            if right_m <= cfg.tof_slow_m():
-                return 1.0, True  # right pinched → peel left
-            return 0.0, False
-        if math.isnan(right_m):
-            if left_m <= cfg.tof_slow_m():
+        """Peel away from the closer hip / closer L8 half. Never toward a wall."""
+        sl = self._side_clear('left')
+        sr = self._side_clear('right')
+        # +ang = left. Left hip closer → turn right (−). Right closer → turn left (+).
+        if not math.isnan(sl) and not math.isnan(sr):
+            if sl < 0.40 or sr < 0.40:
+                if sl < sr - 0.04:
+                    return -1.0, True
+                if sr < sl - 0.04:
+                    return 1.0, True
+            if sl < 0.50 or sr < 0.50:
+                if sl < sr:
+                    return -1.0, True
+                if sr < sl:
+                    return 1.0, True
+        elif not math.isnan(sl) and sl < 0.45:
+            return -1.0, True
+        elif not math.isnan(sr) and sr < 0.45:
+            return 1.0, True
+        l8 = self.l8_opening_sign()
+        if l8 != 0.0:
+            if l8 > 0 and not math.isnan(sl) and sl < 0.32:
                 return -1.0, True
-            return 0.0, False
-        if right_m > left_m + 0.06:
-            sign, confident = -1.0, True
-        elif left_m > right_m + 0.06:
-            sign, confident = 1.0, True
-        else:
-            left_pinched = not math.isnan(tl) and tl < cfg.tof_slow_m()
-            right_pinched = not math.isnan(tr) and tr < cfg.tof_slow_m()
-            if left_pinched and not right_pinched:
-                sign, confident = -1.0, True
-            elif right_pinched and not left_pinched:
-                sign, confident = 1.0, True
-            else:
-                return 0.0, False
-        if sign > 0 and not math.isnan(tl) and tl < cfg.tof_slow_m():
-            sign = -1.0
-        elif sign < 0 and not math.isnan(tr) and tr < cfg.tof_slow_m():
-            sign = 1.0
-        return sign, confident
+            if l8 < 0 and not math.isnan(sr) and sr < 0.32:
+                return 1.0, True
+            return l8, True
+        return 0.0, False
 
     def opening_sign(self, best_deg: float, best_m: float) -> float:
         """Choose a recover/cruise turn from a pan sweep, else ToF."""
@@ -529,38 +743,41 @@ class ProximityState:
     def apply(self, lin: float, ang: float, *, max_steer: float) -> tuple[float, float]:
         """Slow and turn from L8 + side ToF before the ESP bumper brake."""
         cfg = self.cfg
-        fwd = self.front_min_m()
+        fwd = self.front_center_m()
         aft = self.forward_stop_m()
         sl = self._side_clear('left')
         sr = self._side_clear('right')
-        fl = self._front_half('left')
-        fr = self._front_half('right')
+        corridor = self.in_corridor()
+        stop_s = cfg.tof_stop_m()
+        comfort = cfg.side_comfort_m
 
         if lin > 0.02 and not math.isnan(fwd) and fwd < cfg.l8_stop_m:
-            return -min(0.10, max(0.06, abs(lin) * 0.55)), 0.0
+            if corridor or self.along_wall():
+                # Forward brake only — caller/recover must reverse; zero lin here
+                # makes the ESP drop turn as well.
+                lin = min(lin, 0.0)
+            else:
+                return -min(0.10, max(0.08, abs(lin) * 0.55)), 0.0
 
         if lin < -0.02 and self.cfg.sonar_faces_rear and not math.isnan(aft):
             bumper_clear = aft - cfg.sonar_to_bumper_m
             if bumper_clear < cfg.stop_bumper_m:
                 return 0.0, ang
 
-        # Side ToF: corridor-center when both walls visible; otherwise peel
-        # from a closing wall (shallow angle included via L8 halves below).
-        comfort = cfg.side_comfort_m
-        stop_s = cfg.tof_stop_m()
-        corridor = (
-            not math.isnan(sl)
-            and not math.isnan(sr)
-            and sl < cfg.side_corridor_max_m
-            and sr < cfg.side_corridor_max_m
-        )
+        if self.side_too_close() and lin > 0.02:
+            ang = self.hip_repel(0.04) if corridor else self.turn_away_from_closest() * 0.05
+            return -0.10, ang
+
         steer = 0.0
-        if lin > 0.02:
-            if corridor:
-                steer = -1.8 * (sr - sl)
-            else:
-                left_err = 0.0
-                right_err = 0.0
+        if corridor:
+            steer = self.hip_repel(0.04)
+            pinch = min((v for v in (sl, sr) if not math.isnan(v)), default=1.0)
+            if pinch < 0.22:
+                lin = min(lin, 0.11) if lin > 0 else lin
+        else:
+            left_err = 0.0
+            right_err = 0.0
+            if lin > 0.02:
                 if not math.isnan(sl) and sl < comfort:
                     left_err = (comfort - sl) / max(0.04, comfort - stop_s)
                 if not math.isnan(sr) and sr < comfort:
@@ -570,46 +787,29 @@ class ProximityState:
                 left_err = max(0.0, min(1.4, left_err))
                 right_err = max(0.0, min(1.4, right_err))
                 steer = (right_err - left_err) * max_steer
+                gap = self.l8_gap_steer(max_steer)
+                if abs(gap) > abs(steer):
+                    steer = 0.65 * steer + 0.35 * gap
+                elif abs(steer) < 0.02:
+                    steer = gap
+                pinch = 0.0
+                if not math.isnan(sl):
+                    pinch = max(pinch, max(0.0, comfort - sl))
+                if not math.isnan(sr):
+                    pinch = max(pinch, max(0.0, comfort - sr))
+                if pinch > 0.12:
+                    lin = min(lin, lin * 0.50)
+                elif pinch > 0.04:
+                    lin = min(lin, lin * 0.75)
 
-            if not math.isnan(fl) and not math.isnan(fr):
-                closer = min(fl, fr)
-                if closer < cfg.l8_slow_m and abs(fl - fr) > 0.08:
-                    l8_w = (cfg.l8_slow_m - closer) / max(0.08, cfg.l8_slow_m - cfg.l8_stop_m)
-                    l8_w = max(0.15, min(1.0, l8_w))
-                    steer += (-1.0 if fl < fr else 1.0) * max_steer * l8_w
-            elif not math.isnan(fl) and fl < cfg.l8_slow_m:
-                steer -= max_steer * 0.55
-            elif not math.isnan(fr) and fr < cfg.l8_slow_m:
-                steer += max_steer * 0.55
+        if abs(steer) >= 0.02:
+            ang = max(-max_steer, min(max_steer, steer))
 
-            if abs(steer) >= 0.02:
-                ang = max(-max_steer, min(max_steer, steer))
-                if not corridor:
-                    pinch = 0.0
-                    if not math.isnan(sl):
-                        pinch = max(pinch, max(0.0, comfort - sl))
-                    if not math.isnan(sr):
-                        pinch = max(pinch, max(0.0, comfort - sr))
-                    if pinch > 0.12:
-                        lin = min(lin, lin * 0.50)
-                    elif pinch > 0.04:
-                        lin = min(lin, lin * 0.75)
-
-        if lin > 0.02 and not math.isnan(fwd) and fwd < cfg.l8_slow_m:
+        if lin > 0.02 and not math.isnan(fwd) and fwd < cfg.l8_slow_m and not corridor:
             scale = (fwd - cfg.l8_stop_m) / max(0.08, cfg.l8_slow_m - cfg.l8_stop_m)
             lin = min(lin, lin * max(0.30, min(1.0, scale)))
             if abs(steer) < 0.02 and fwd < cfg.l8_turn_m:
                 ang = self.turn_away_from_closest() * max_steer
-
-        if lin > 0.02:
-            if ang > 0.02 and not math.isnan(sl) and sl < cfg.tof_slow_m():
-                frac = (cfg.tof_slow_m() - sl) / max(0.05, cfg.tof_slow_m() - cfg.tof_stop_m())
-                ang -= max_steer * cfg.side_steer_gain * max(0.15, min(1.0, frac))
-                lin *= 0.90
-            elif ang < -0.02 and not math.isnan(sr) and sr < cfg.tof_slow_m():
-                frac = (cfg.tof_slow_m() - sr) / max(0.05, cfg.tof_slow_m() - cfg.tof_stop_m())
-                ang += max_steer * cfg.side_steer_gain * max(0.15, min(1.0, frac))
-                lin *= 0.90
 
         ang = max(-max_steer, min(max_steer, ang))
         return lin, ang

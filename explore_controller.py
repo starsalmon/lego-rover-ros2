@@ -104,13 +104,7 @@ def _imu_gyro_sign() -> float:
 
 
 def _front_ir_stop() -> bool:
-    # Always use the custom front bumper unless explicitly off. Sonar does not
-    # replace L/R IR — they fire at contact range (angle vs head-on).
-    return os.environ.get('ROVER_IR_FRONT_STOP', '1').strip().lower() not in (
-        '0',
-        'no',
-        'false',
-    )
+    return False
 
 
 def _sonar_front() -> bool:
@@ -134,12 +128,12 @@ def _cap_angular(ang: float) -> float:
 def _arc_not_spin(lin: float, ang: float) -> tuple[float, float]:
     if abs(ang) <= 0.02:
         return lin, ang
+    if abs(lin) < 0.02:
+        return lin, ang
     if abs(lin) >= MIN_LIN_FOR_STEER:
         return lin, ang
     # Preserve sign: never turn a tiny reverse into forward creep.
     creep = MIN_LIN_FOR_STEER if lin >= 0 else -MIN_LIN_FOR_STEER
-    if abs(lin) < 0.02:
-        creep = MIN_LIN_FOR_STEER if lin >= 0 else -MIN_LIN_FOR_STEER
     return creep, ang
 
 
@@ -198,7 +192,7 @@ class ExploreController:
         cap = _max_linear()
         steer = _max_steer()
         self._cruise_speed = cap * 0.85
-        self._cruise_curve = 0.04
+        self._cruise_curve = 0.0
         self.wander_ang = 0.05
         self.wander_lin = cap * 0.80
 
@@ -392,6 +386,21 @@ class ExploreController:
                      right_m: float = float('nan')) -> None:
         self._proximity.update_front_tof(center_m, left_m, right_m)
 
+    def on_l8_cols(self, cols: list[float]) -> None:
+        self._proximity.update_l8_cols(cols)
+
+    def react_corridor(self) -> bool:
+        """Two walls visible — hallway follower owns the twist, whatever explore mode."""
+        if time.monotonic() < self._scan_until:
+            return False
+        return self._proximity.in_corridor()
+
+    def leave_recover_for_hallway(self) -> None:
+        if self.mode == Mode.RECOVER:
+            self._enter(Mode.CRUISE, 6.0)
+            self._recover_sign = 0.0
+            self._recover_phase = RecoverPhase.REVERSE
+
     def on_imu(self, gz_rad_s: float) -> None:
         now = time.monotonic()
         gz = self._imu_gyro_sign * float(gz_rad_s)
@@ -432,7 +441,9 @@ class ExploreController:
         if not confident:
             sign = self._proximity.turn_away_from_closest()
         if sign == 0.0:
-            sign = 1.0
+            sign = self._proximity.l8_opening_sign()
+        if sign == 0.0:
+            sign = -1.0  # last resort: peel right, not a coin-flip each recover
         self._recover_need_scan = False
         self._recover_did_scan = True
         self._scan_until = 0.0
@@ -469,35 +480,47 @@ class ExploreController:
         note = self._memory.mark_blocked(self._yaw_integrated, reason=reason)
         if note:
             self._log(note)
+        hip = self._proximity.turn_away_from_closest()
         sign, confident = self._proximity.live_opening_sign()
-        ir_sign = self._ir_away_sign()
-        if ir_sign != 0.0:
-            sign = ir_sign
-            confident = True
-        if confident:
-            sign, mem_msg = self._memory.prefer_sign(self._yaw_integrated, sign)
-            if mem_msg:
-                self._log(mem_msg)
-        else:
+        if hip != 0.0:
+            sl = self._proximity._side_clear('left')
+            sr = self._proximity._side_clear('right')
+            pinched = (
+                (not math.isnan(sl) and sl < 0.40)
+                or (not math.isnan(sr) and sr < 0.40)
+            )
+            if pinched:
+                sign = hip
+                confident = True
+        if not confident:
+            ir_sign = self._ir_away_sign()
+            if ir_sign != 0.0:
+                sign = ir_sign
+                confident = True
+        if not confident:
             guessed, mem_msg = self._memory.suggest_sign(self._yaw_integrated)
             if guessed != 0.0:
                 sign, confident = guessed, True
                 if mem_msg:
                     self._log(mem_msg)
-        self._recover_sign = sign if confident else 0.0
+        self._recover_sign = sign if confident else hip if hip != 0.0 else 0.0
+        if self._recover_sign != 0.0:
+            confident = True
         self._recover_need_scan = not confident
         if confident:
-            self._proximity.commit_steer_away(sign, 6.0)
+            self._proximity.commit_steer_away(self._recover_sign, 6.0)
 
         if nose:
             # Nose in the wall — back off straight. Don't steer in reverse
             # (that swings the tail into the same wall). Abort if stall fires.
             self._recover_phase = RecoverPhase.REVERSE
-            self._recover_reverse_until = now + 0.35
+            self._recover_reverse_until = now + 1.2
             self.mode_until = self._recover_reverse_until
-            self._mode_dur = 0.35
-            side = 'scan' if not confident else ('left' if sign > 0 else 'right')
-            self._log(f'recover ({reason}): reverse then {side}')
+            self._mode_dur = 1.2
+            side = 'scan' if self._recover_sign == 0.0 else (
+                'left' if self._recover_sign > 0 else 'right'
+            )
+            self._log(f'recover ({reason}): reverse then peel {side}')
             return
 
         if not confident:
@@ -509,7 +532,7 @@ class ExploreController:
         self._recover_driveout_until = now + 4.0
         self.mode_until = self._recover_driveout_until
         self._mode_dur = 4.0
-        side = 'left' if sign > 0 else 'right'
+        side = 'left' if self._recover_sign > 0 else 'right'
         self._log(f'recover ({reason}): peel {side} until clear')
 
     def _tick_recover(self, now: float) -> tuple[float, float]:
@@ -521,7 +544,8 @@ class ExploreController:
                 self._recover_peel(now, note=f'{why} in reverse')
                 return 0.0, 0.0
             if now < self._recover_reverse_until:
-                return -min(0.08, _reverse_power()), 0.0
+                turn = 0.0 if self._recover_sign == 0.0 else self._recover_sign * 0.05
+                return -max(0.10, min(0.14, _reverse_power())), turn
             if self._recover_need_scan or self._recover_sign == 0.0:
                 self._recover_peel(now, note='reverse done')
                 return 0.0, 0.0
@@ -540,11 +564,19 @@ class ExploreController:
         if self._recover_sign != 0.0:
             jammed = self._proximity.is_nose_jammed()
             turned = self._recover_turned_deg()
-            open_enough = self._proximity.front_open()
+            open_enough = self._proximity.path_clear_to_drive()
+            hip = self._proximity.turn_away_from_closest()
+            if hip != 0.0:
+                sl = self._proximity._side_clear('left')
+                sr = self._proximity._side_clear('right')
+                if (not math.isnan(sl) and sl < 0.40) or (not math.isnan(sr) and sr < 0.40):
+                    self._recover_sign = hip
             if jammed:
-                return -min(0.08, _reverse_power()), 0.0
-            ang = self._recover_sign * self._recover_steer()
-            lin = max(0.07, min(_max_linear() * 0.50, 0.10))
+                # ESP zeros forward when the nose is < 24 cm, and then ignores
+                # turn. Reverse is the only command that still moves.
+                return -max(0.10, min(0.14, _reverse_power())), self._recover_sign * 0.05
+            ang = self._recover_sign * min(0.05, self._recover_steer())
+            lin = max(0.11, min(_max_linear() * 0.85, 0.12))
             done = (turned >= self._recover_yaw_need and open_enough) or (
                 now >= self._recover_driveout_until and turned >= 40.0 and open_enough
             )
@@ -561,10 +593,12 @@ class ExploreController:
                 self._recover_driveout_until = now + 2.0
                 self.mode_until = self._recover_driveout_until
                 if turned >= 70.0:
-                    self._recover_sign = -self._recover_sign
+                    # Keep peeling away from the closer hip. Do not flip into the wall.
+                    if hip != 0.0:
+                        self._recover_sign = hip
                     self._recover_yaw_start = self._yaw_integrated
                     self._proximity.commit_steer_away(self._recover_sign, 6.0)
-                    self._log('recover: still closed — turn the other way')
+                    self._log('recover: still closed — keep peeling away from the wall')
             return lin, ang
 
         self._enter(Mode.CRUISE, random.uniform(4.0, 7.0))
@@ -613,7 +647,7 @@ class ExploreController:
         if mode == Mode.CRUISE:
             # Wider spread makes it feel less "one speed".
             self._cruise_speed = random.uniform(cap * 0.55, cap * 0.92)
-            if random.random() < 0.82:
+            if self._proximity.in_corridor() or random.random() < 0.82:
                 self._cruise_curve = 0.0
             else:
                 self._cruise_curve = random.choice([-1, 1]) * random.uniform(0.01, steer * 0.18)
@@ -758,13 +792,16 @@ class ExploreController:
 
         # Oscillation + a blocked nose: reverse straight, then peel. No sit-and-scan.
         if self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST) and now >= self._event_ignore_until:
-            if self._imu_oscillating(now) and self._proximity.is_forward_blocked():
+            if self._proximity.in_corridor():
+                pass
+            elif self._imu_oscillating(now) and self._proximity.is_forward_blocked():
                 self._start_recover(now, reason="oscillation")
-            elif self._proximity.wants_early_turn() or self._proximity.is_nose_jammed():
+            elif self._proximity.is_nose_jammed() or self._proximity.wants_early_turn():
                 self._start_recover(now, reason="l8 close")
 
         if self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST) and now >= self.mode_until:
-            self._next_mode()
+            if not self._proximity.in_corridor():
+                self._next_mode()
 
         lin = 0.0
         ang = 0.0
@@ -800,25 +837,30 @@ class ExploreController:
         # ESP owns the forward brake; brain just biases away early.
         if (not scanning) and _sonar_front() and self.mode in (
             Mode.CRUISE, Mode.WANDER, Mode.BURST
-        ):
+        ) and not self._proximity.in_corridor():
             lin, ang = self._proximity.apply(lin, ang, max_steer=_max_steer())
-            commit = self._proximity.steer_commit_active(now)
-            if commit != 0.0:
-                ang = max(-_max_steer(), min(_max_steer(), ang + commit * _max_steer() * 0.35))
-            mem = self._memory.cruise_bias(self._yaw_integrated, _max_steer())
-            if abs(mem) >= 0.02:
-                ang = max(-_max_steer(), min(_max_steer(), ang + mem))
-                lin = min(lin, _max_linear() * 0.60)
+            if not self._proximity.along_wall():
+                commit = self._proximity.steer_commit_active(now)
+                if commit != 0.0:
+                    ang = max(-_max_steer(), min(_max_steer(), ang + commit * _max_steer() * 0.35))
+                mem = self._memory.cruise_bias(self._yaw_integrated, _max_steer())
+                if abs(mem) >= 0.02:
+                    ang = max(-_max_steer(), min(_max_steer(), ang + mem))
+                    lin = min(lin, _max_linear() * 0.60)
 
         if (not scanning) and self._bg_radar and self.mode in (
             Mode.CRUISE, Mode.WANDER, Mode.BURST
-        ):
+        ) and not self._proximity.along_wall() and not self._proximity.in_corridor():
             ang += self._bg_radar.steer_bias()
 
         if not scanning:
-            lin, ang = self._apply_front_stop(lin, ang, front_blocked)
-
-            lin, ang = _arc_not_spin(lin, ang)
+            if self.react_corridor():
+                lin, ang = self._proximity.corridor_drive(_max_linear())
+            else:
+                lin, ang = self._apply_front_stop(lin, ang, front_blocked)
+                lin, ang = self._proximity.repel_overlay(lin, ang, max_steer=_max_steer())
+                if not self._proximity.must_pivot():
+                    lin, ang = _arc_not_spin(lin, ang)
 
         # Scan finished: commit toward a real opening, never a coin-flip.
         if self._scan_until > 0.0 and now >= self._scan_until and (now - self._scan_started) < 6.0:
