@@ -99,6 +99,8 @@ class WheelOdometry:
         self._ticks_ok = False
         self._drive_since: float | None = None
         self._last_stall_mono = 0.0
+        self._ticks_per_cmd = 0.0
+        self._cal_n = 0
 
     def config_summary(self) -> str:
         return (
@@ -206,7 +208,21 @@ class WheelOdometry:
             return False
 
         combined_rate = abs(snap.left_rate) + abs(snap.right_rate)
-        if combined_rate >= _stall_min_rate():
+        cmd_mag = max(abs(cmd_lin), abs(cmd_ang))
+        if combined_rate >= 1.0 and cmd_mag >= _stall_min_lin():
+            observed = combined_rate / cmd_mag
+            if self._cal_n == 0:
+                self._ticks_per_cmd = observed
+            else:
+                self._ticks_per_cmd = 0.85 * self._ticks_per_cmd + 0.15 * observed
+            self._cal_n = min(255, self._cal_n + 1)
+
+        if self._cal_n >= 4 and self._ticks_per_cmd > 0.5:
+            expect = self._ticks_per_cmd * cmd_mag
+            floor = max(0.6, 0.30 * expect)
+        else:
+            floor = _stall_min_rate()
+        if combined_rate >= floor:
             return False
 
         if now - self._drive_since < _stall_ms():
@@ -215,3 +231,9 @@ class WheelOdometry:
         self._last_stall_mono = now
         self._drive_since = None
         return True
+
+    def wheels_turning(self, min_rate: float = 1.5) -> bool:
+        snap = self.snapshot()
+        if not snap.ticks_ok:
+            return False
+        return (abs(snap.left_rate) + abs(snap.right_rate)) >= min_rate

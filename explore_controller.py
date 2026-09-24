@@ -25,10 +25,10 @@ BURST_PROB = 0.01
 BURST_DURATION = (0.8, 1.2)
 
 ESCAPE_REVERSE_SEC = 1.0
-ESCAPE_ARC_LIN = 0.22
-ESCAPE_ARC_ANG = 0.12
-SPIN_DEG_MIN = 45
-SPIN_DEG_MAX = 85
+ESCAPE_ARC_LIN = 0.10
+ESCAPE_ARC_ANG = 0.06
+SPIN_DEG_MIN = 20
+SPIN_DEG_MAX = 35
 
 FRONT_AVOID_REVERSE_SEC = 1.0
 FRONT_AVOID_STRAIGHT_SEC = 0.40
@@ -49,8 +49,10 @@ ESCAPE_FLOOD_PAUSE_SEC = 10.0
 ARC_YAW_TOL_DEG = 8.0
 
 # Brain-side output slew — always on. ESP still ramps wheels in time.
-LIN_SLEW_PER_S = 0.40
-ANG_SLEW_PER_S = 0.28
+LIN_SLEW_PER_S = 0.32
+LIN_BRAKE_SLEW_PER_S = 0.18
+ANG_SLEW_PER_S = 0.22
+ANG_BRAKE_SLEW_PER_S = 0.14
 
 # ESP cal_sweep duration (rover_sonar.cpp). Keep in sync so scan windows don’t
 # “do nothing” for multiple seconds.
@@ -220,6 +222,7 @@ class ExploreController:
         self._event_ignore_until = self._start_time + STARTUP_GRACE_SEC
         self._bump_pending = False
         self._stall_pending = False
+        self._wheel_travel_m = 0.0
         self._scan_done = False
         self._ir_front_cooldown_until = 0.0
         self._ir_fl = False
@@ -290,6 +293,10 @@ class ExploreController:
     def on_stall(self) -> None:
         self._stall_pending = True
 
+    def add_wheel_travel(self, delta_m: float) -> None:
+        if delta_m > 0.0:
+            self._wheel_travel_m += delta_m
+
     def on_ir_hits(self, bits: int) -> None:
         """ESP delta IR: bit0=front L, bit1=front R, bit2=rear."""
         bits = int(bits) & 0xFF
@@ -311,8 +318,11 @@ class ExploreController:
             return 1.0
         return 0.0
 
+    def _rear_ir_bumper(self) -> bool:
+        return self._ir_fresh() and self._ir_rear
+
     def _rear_ir_hit(self) -> bool:
-        if self._ir_fresh() and self._ir_rear:
+        if self._rear_ir_bumper():
             return True
         return self._proximity.is_rear_blocked()
 
@@ -394,6 +404,13 @@ class ExploreController:
         if time.monotonic() < self._scan_until:
             return False
         return self._proximity.in_corridor()
+
+    def allows_nav_blend(self) -> bool:
+        """Nav2 may nudge cruise — never during escape/recover/avoid."""
+        return self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST)
+
+    def allows_wheel_stall_check(self) -> bool:
+        return self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST)
 
     def leave_recover_for_hallway(self) -> None:
         if self.mode == Mode.RECOVER:
@@ -690,6 +707,7 @@ class ExploreController:
         self.escape_phase = EscapePhase.REVERSE
         self.escape_backoff = -_reverse_power()
         self.reverse_until = now + ESCAPE_REVERSE_SEC
+        self._escape_reverse_started = now
         self.mode = Mode.ESCAPE
         self._ir_wait_clear = False
         self._log(f'escape ({reason}): reverse → arc (IMU-limited)')
@@ -712,7 +730,11 @@ class ExploreController:
         steer = max(0.08, min(ESCAPE_ARC_ANG, _max_steer()))
         now = time.monotonic()
         spin_deg = random.uniform(SPIN_DEG_MIN, SPIN_DEG_MAX)
-        spin_dir = random.choice([-1.0, 1.0]) * self._escape_spin_sign
+        sign, confident = self._proximity.live_opening_sign()
+        if confident and sign != 0.0:
+            spin_dir = sign
+        else:
+            spin_dir = random.choice([-1.0, 1.0]) * self._escape_spin_sign
         bearing = -1.0
 
         if self._bg_radar is not None:
@@ -745,8 +767,9 @@ class ExploreController:
     def _finish_escape_arc(self, now: float) -> None:
         self._event_ignore_until = now + EVENT_COOLDOWN_SEC
         self.straight_block_until = now + STRAIGHT_BLOCK_SEC
-        if self.arc_steer != 0.0:
-            self._proximity.commit_steer_away(1.0 if self.arc_steer > 0.0 else -1.0, 6.0)
+        sign, confident = self._proximity.live_opening_sign()
+        if confident and sign != 0.0:
+            self._proximity.commit_steer_away(sign, 1.5)
         self._enter(Mode.CRUISE, random.uniform(5.0, 9.0))
         self._memory.start_leg()
         self._log('escape done → straight cruise')
@@ -835,14 +858,14 @@ class ExploreController:
 
         # Tier-1 shaping: slow + steer-away in open room. Never hard-stop here —
         # ESP owns the forward brake; brain just biases away early.
-        if (not scanning) and _sonar_front() and self.mode in (
-            Mode.CRUISE, Mode.WANDER, Mode.BURST
-        ) and not self._proximity.in_corridor():
-            lin, ang = self._proximity.apply(lin, ang, max_steer=_max_steer())
+        if (not scanning) and self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST):
+            lin, ang = self._proximity.cap_forward_l8(lin, ang, max_steer=_max_steer())
+            if _sonar_front() and not self._proximity.in_corridor():
+                lin, ang = self._proximity.apply(lin, ang, max_steer=_max_steer())
             if not self._proximity.along_wall():
                 commit = self._proximity.steer_commit_active(now)
                 if commit != 0.0:
-                    ang = max(-_max_steer(), min(_max_steer(), ang + commit * _max_steer() * 0.35))
+                    ang = max(-_max_steer(), min(_max_steer(), ang + commit * _max_steer() * 0.22))
                 mem = self._memory.cruise_bias(self._yaw_integrated, _max_steer())
                 if abs(mem) >= 0.02:
                     ang = max(-_max_steer(), min(_max_steer(), ang + mem))
@@ -893,14 +916,14 @@ class ExploreController:
         # Always slew, including escape/avoid/scan. Skipping slew is how jerk
         # and the left/right waggle come back after a "perfect" week.
         dt = 0.05
-        dlin = LIN_SLEW_PER_S * dt
-        dang = ANG_SLEW_PER_S * dt
         lin_tgt = lin
         ang_tgt = ang
         if self._out_lin * lin < 0.0 and abs(self._out_lin) > 0.03:
             lin_tgt = 0.0
         if self._out_ang * ang < 0.0 and abs(self._out_ang) > 0.02:
             ang_tgt = 0.0
+        dlin = (LIN_BRAKE_SLEW_PER_S if abs(lin_tgt) < abs(self._out_lin) else LIN_SLEW_PER_S) * dt
+        dang = (ANG_BRAKE_SLEW_PER_S if abs(ang_tgt) < abs(self._out_ang) else ANG_SLEW_PER_S) * dt
         lin = max(self._out_lin - dlin, min(self._out_lin + dlin, lin_tgt))
         ang = max(self._out_ang - dang, min(self._out_ang + dang, ang_tgt))
         self._out_lin = lin
@@ -925,8 +948,10 @@ class ExploreController:
             self.mode == Mode.RECOVER and self._recover_phase == RecoverPhase.DRIVE_OUT
         ):
             self._memory.note_progress(
-                lin, dt, self._yaw_integrated, front_open=self._proximity.front_open()
+                lin, dt, self._yaw_integrated, front_open=self._proximity.front_open(),
+                travel_m=self._wheel_travel_m if self._wheel_travel_m > 0.0 else None,
             )
+            self._wheel_travel_m = 0.0
         self._sync_bg_radar()
         return lin, ang
 
@@ -966,14 +991,15 @@ class ExploreController:
         lin = 0.0
         ang = 0.0
         if self.escape_phase == EscapePhase.REVERSE:
-            if self._rear_ir_hit():
-                self._log('escape: rear IR — stop reverse, scan')
-                self.escape_phase = EscapePhase.SCAN
-                lin = 0.0
-            elif now < self.reverse_until:
-                lin = self.escape_backoff
+            elapsed = now - getattr(self, '_escape_reverse_started', now)
+            rear = elapsed >= 0.45 and self._rear_ir_bumper()
+            if rear or now >= self.reverse_until:
+                if rear:
+                    self._log('escape: rear bumper — peel')
+                if not self._scan_done:
+                    self._run_escape_scan()
             else:
-                self.escape_phase = EscapePhase.SCAN
+                lin = self.escape_backoff
         elif self.escape_phase == EscapePhase.SCAN:
             if not self._scan_done:
                 self._run_escape_scan()
@@ -981,6 +1007,8 @@ class ExploreController:
             if front_blocked:
                 self.escape_phase = EscapePhase.REVERSE
                 self.reverse_until = now + ESCAPE_REVERSE_SEC * 0.7
+                self._escape_reverse_started = now
+                self._scan_done = False
                 lin = self.escape_backoff
                 self._log('escape arc blocked — reverse again')
             else:

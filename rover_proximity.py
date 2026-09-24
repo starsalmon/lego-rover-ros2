@@ -118,6 +118,10 @@ class ProximityState:
     _tof_r_prev: tuple[float, float] | None = None
     _l8_cols: list[float] = field(default_factory=lambda: [float('nan')] * 8)
     _l8_cols_ms: float = 0.0
+    _l8_fwd_ema: float = field(default_factory=lambda: float('nan'))
+    _l8_near_streak: int = 0
+    # Firmware used to publish 3.5 m as "clear" — not a real range.
+    _l8_open_m: float = 3.0
     _corr_filt: float = 0.0
     _corridor_seen: float = 0.0
 
@@ -166,17 +170,42 @@ class ProximityState:
             self._tof_r = range_m
         self._tof_r_ms = now
 
+    def _l8_real_m(self, v: float) -> float:
+        if math.isnan(v) or v <= 0.02 or v >= self._l8_open_m:
+            return float('nan')
+        return v
+
+    def _note_l8_distance(self, d: float) -> None:
+        if math.isnan(d) or d >= 0.55:
+            self._l8_near_streak = max(0, self._l8_near_streak - 1)
+        else:
+            self._l8_near_streak = min(12, self._l8_near_streak + 1)
+
+    def _push_l8_ema(self, v: float) -> None:
+        v = self._l8_real_m(v)
+        if math.isnan(v):
+            return
+        if math.isnan(self._l8_fwd_ema):
+            self._l8_fwd_ema = v
+        else:
+            self._l8_fwd_ema = 0.55 * self._l8_fwd_ema + 0.45 * v
+        self._note_l8_distance(self._l8_fwd_ema)
+
+    def l8_sustained_close(self, frames: int = 3) -> bool:
+        return self._l8_near_streak >= frames
+
     def update_front_tof(self, center_m: float, left_m: float = float('nan'),
                          right_m: float = float('nan')) -> None:
         now = time.monotonic()
         self._front_ms = now
 
         def _ok(v: float) -> float:
-            if math.isnan(v) or v <= 0.0 or v > 4.0:
-                return float('nan')
-            return v
+            return self._l8_real_m(v)
 
-        self._front_m = _ok(center_m)
+        center = _ok(center_m)
+        self._front_m = center
+        if not math.isnan(center):
+            self._push_l8_ema(center)
         if not math.isnan(left_m):
             self._front_l = _ok(left_m)
         if not math.isnan(right_m):
@@ -190,10 +219,14 @@ class ProximityState:
                 v = float(raw)
             except (TypeError, ValueError):
                 continue
-            if math.isfinite(v) and 0.02 < v < 4.0:
+            v = self._l8_real_m(v)
+            if not math.isnan(v):
                 out[i] = v
         self._l8_cols = out
         self._l8_cols_ms = now
+        vals = [v for v in out if not math.isnan(v)]
+        if vals:
+            self._push_l8_ema(min(vals))
 
     def _front_fresh(self, max_age_s: float = 0.5) -> bool:
         return (time.monotonic() - self._front_ms) <= max_age_s
@@ -212,9 +245,11 @@ class ProximityState:
         return v
 
     def front_center_m(self) -> float:
-        """Inner 4×4 — used for stop/reverse. Halves are for steer only."""
+        """Inner nose range — EMA filtered; open/floor is NaN not 3.5 m."""
         if not self._front_fresh():
             return float('nan')
+        if not math.isnan(self._l8_fwd_ema):
+            return self._l8_fwd_ema
         return self._front_m
 
     def front_min_m(self) -> float:
@@ -346,8 +381,10 @@ class ProximityState:
             return lin, ang
         closer = min(vals)
         if closer < 0.28:
-            # lin=0 makes ESP ignore turn. Reverse+nudge actually moves.
-            return -0.10, self.turn_away_from_closest() * 0.05
+            # lin=0 makes ESP ignore turn. Ease into reverse — recover owns hard peel.
+            return -min(0.08, max(0.06, abs(lin) * 0.5 if lin > 0.02 else 0.06)), (
+                self.turn_away_from_closest() * 0.05
+            )
         if self.in_corridor():
             return lin, ang
         if self.along_wall() and not math.isnan(sl) and not math.isnan(sr):
@@ -373,6 +410,8 @@ class ProximityState:
         comfort = 0.50
         ang = 0.0
         both = not math.isnan(sl) and not math.isnan(sr)
+        if both and abs(sl - sr) < 0.08:
+            return 0.0
         # 2–6 cm of noise while both hips are comfortable is not a turn.
         if both and min(sl, sr) > 0.42 and abs(sl - sr) < 0.08:
             ang -= 0.03 * min(1.0, self._side_closing('left') / 0.12)
@@ -478,6 +517,8 @@ class ProximityState:
 
     def is_nose_jammed(self) -> bool:
         """ESP brakes forward at 0.24 m. Must reverse — a zeroed lin also kills turn."""
+        if not self.l8_sustained_close(3):
+            return False
         fwd = self.front_center_m()
         if not math.isnan(fwd) and fwd < 0.26:
             return True
@@ -488,6 +529,8 @@ class ProximityState:
 
     def wants_early_turn(self) -> bool:
         """Wall entering the nose FOV — peel before the bumper."""
+        if not self.l8_sustained_close(2):
+            return False
         if self.along_wall() or self.in_corridor():
             col = self.l8_col_min()
             if not math.isnan(col) and col < 0.40:
@@ -740,6 +783,29 @@ class ProximityState:
             return 0.0
         return max(0.0, -(cur - prev[1]) / dt)
 
+    def cap_forward_l8(self, lin: float, ang: float, *, max_steer: float) -> tuple[float, float]:
+        """Gradual nose slow/steer — must run in hallways too (ESP brakes at 24 cm)."""
+        if lin <= 0.02:
+            return lin, ang
+        fwd = self.front_center_m()
+        if math.isnan(fwd):
+            fwd = self.l8_col_min()
+        if math.isnan(fwd):
+            return lin, ang
+        cfg = self.cfg
+        if fwd >= cfg.l8_slow_m:
+            return lin, ang
+        if fwd < cfg.l8_turn_m:
+            gap = self.l8_gap_steer(max_steer)
+            if abs(gap) >= 0.02:
+                ang = max(-max_steer, min(max_steer, gap))
+        if fwd < cfg.l8_stop_m:
+            lin = min(lin, max(0.06, lin * 0.30))
+        else:
+            scale = (fwd - cfg.l8_stop_m) / max(0.08, cfg.l8_slow_m - cfg.l8_stop_m)
+            lin = min(lin, lin * max(0.22, min(1.0, scale)))
+        return lin, ang
+
     def apply(self, lin: float, ang: float, *, max_steer: float) -> tuple[float, float]:
         """Slow and turn from L8 + side ToF before the ESP bumper brake."""
         cfg = self.cfg
@@ -753,11 +819,10 @@ class ProximityState:
 
         if lin > 0.02 and not math.isnan(fwd) and fwd < cfg.l8_stop_m:
             if corridor or self.along_wall():
-                # Forward brake only — caller/recover must reverse; zero lin here
-                # makes the ESP drop turn as well.
-                lin = min(lin, 0.0)
+                # Coast down — a hard zero here reads as a sudden stop on carpet.
+                lin = min(lin, max(0.06, lin * 0.45))
             else:
-                return -min(0.10, max(0.08, abs(lin) * 0.55)), 0.0
+                return -min(0.08, max(0.06, abs(lin) * 0.45)), ang * 0.5
 
         if lin < -0.02 and self.cfg.sonar_faces_rear and not math.isnan(aft):
             bumper_clear = aft - cfg.sonar_to_bumper_m

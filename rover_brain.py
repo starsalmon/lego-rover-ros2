@@ -21,6 +21,7 @@ from explore_controller import ExploreController
 from hallway_follow import HallwayConfig, HallwayFollow
 from rover_qos import CMD_VEL_QOS
 from cmd_vel_slew import CmdVelSlew
+from rover_wheel_odom import WheelOdometry
 
 BTN_ESTOP_LONG = 3
 DRIVE_EXPLORE = 0
@@ -57,10 +58,20 @@ class RoverBrain(Node):
         self._brake_scan_cooldown_until = 0.0
         self._slew = CmdVelSlew.from_env()
         self._slew_t = time.monotonic()
+        self._wheels = WheelOdometry()
+        self._wheel_dist_m = 0.0
+        self.get_logger().info(f'wheel odom: {self._wheels.config_summary()}')
         self._front_c = float('nan')
         self._front_l = float('nan')
         self._front_r = float('nan')
         self._in_corridor = False
+        self._nav2 = os.environ.get('ROVER_NAV2', '0').strip().lower() in ('1', 'true', 'yes')
+        self._nav_cmd = (0.0, 0.0)
+        self._nav_cmd_t = 0.0
+        self._nav_smooth = (0.0, 0.0)
+        if self._nav2:
+            self.create_subscription(Twist, '/cmd_vel_nav', self._on_nav_cmd, 10)
+            self.get_logger().info('motion source: Nav2 /cmd_vel_nav (Go still gates the wheels)')
 
         self._allow_drive = True
         self.create_subscription(Bool, '/fleet/allow_drive', self._on_allow_drive, 10)
@@ -71,6 +82,8 @@ class RoverBrain(Node):
         self.create_subscription(Imu, '/imu/data', self._on_imu, 10)
         self.create_subscription(Bool, '/rover/bump', self._on_bump, 10)
         self.create_subscription(Bool, '/rover/stall', self._on_stall, 10)
+        self.create_subscription(UInt32, '/rover/wheel/left_ticks', self._on_wheel_left, 10)
+        self.create_subscription(UInt32, '/rover/wheel/right_ticks', self._on_wheel_right, 10)
         self.create_subscription(Range, '/rover/sonar/range', self._on_range, 10)
         self.create_subscription(Float32, '/rover/sonar/pan_deg', self._on_pan, 10)
         self.create_subscription(Bool, '/rover/sonar/avoid_active', self._on_sonar_avoid, 10)
@@ -129,6 +142,7 @@ class RoverBrain(Node):
                 self._explore.reset()
             self._slew.reset()
             self._slew_t = time.monotonic()
+            self._nav_smooth = (0.0, 0.0)
             self.get_logger().info(f'session START ({reason}) — {"wall" if self._wall_follow() else "explore"}')
         else:
             self.get_logger().info(f'session STOP ({reason})')
@@ -198,12 +212,38 @@ class RoverBrain(Node):
             self._explore.on_imu(float(msg.angular_velocity.z))
 
     def _on_bump(self, msg: Bool) -> None:
-        if msg.data and not self._wall_follow() and self._session_active:
-            self._explore.on_bump()
+        if not msg.data or self._wall_follow() or not self._session_active:
+            return
+        # A jolt while the wheels are still turning is not a reason to spin.
+        # The last runs were bump → 60° arc → drive → bump, over and over.
+        if self._wheels.wheels_turning() and not self._explore._proximity.is_nose_jammed():
+            self.get_logger().info('bump ignored — wheels still turning, nose not jammed')
+            return
+        self._explore.on_bump()
 
     def _on_stall(self, msg: Bool) -> None:
-        if msg.data and not self._wall_follow() and self._session_active:
-            self._explore.on_stall()
+        if not msg.data or self._wall_follow() or not self._session_active:
+            return
+        if self._wheels.wheels_turning():
+            self.get_logger().info('stall ignored — wheel ticks are still moving')
+            return
+        self._explore.on_stall()
+
+    def _on_wheel_left(self, msg: UInt32) -> None:
+        self._wheels.on_left(int(msg.data))
+        self._note_wheel_distance()
+
+    def _on_wheel_right(self, msg: UInt32) -> None:
+        self._wheels.on_right(int(msg.data))
+        self._note_wheel_distance()
+
+    def _note_wheel_distance(self) -> None:
+        dist = self._wheels.snapshot().distance_m
+        delta = dist - self._wheel_dist_m
+        if delta > 0.0:
+            self._wheel_dist_m = dist
+            if self._session_active and not self._wall_follow():
+                self._explore.add_wheel_travel(delta)
 
     def _on_tof_left(self, msg: Range) -> None:
         rng = float(msg.range)
@@ -246,6 +286,38 @@ class RoverBrain(Node):
         elif self._session_active:
             self._explore.on_ir_hits(bits)
 
+    def _on_nav_cmd(self, msg: Twist) -> None:
+        lin = max(-0.12, min(0.15, float(msg.linear.x)))
+        ang = max(-0.35, min(0.35, float(msg.angular.z)))
+        # Nav2 publishes ~40 Hz with hard zeros when stuck — low-pass so we
+        # don't stamp explore's smooth output to a stop every other frame.
+        alpha = 0.18
+        slin, sang = self._nav_smooth
+        self._nav_smooth = (
+            slin + alpha * (lin - slin),
+            sang + alpha * (ang - sang),
+        )
+        self._nav_cmd = self._nav_smooth
+        self._nav_cmd_t = time.monotonic()
+
+    def _nav_cmd_live(self) -> bool:
+        if not self._nav2:
+            return False
+        if time.monotonic() - self._nav_cmd_t > 0.5:
+            return False
+        lin, ang = self._nav_cmd
+        # Ignore Nav2 "stop" — explore keeps cruise; only blend real motion.
+        return abs(lin) > 0.04 or abs(ang) > 0.04
+
+    def _blend_nav(self, lin: float, ang: float) -> tuple[float, float]:
+        if not self._nav_cmd_live() or not self._explore.allows_nav_blend():
+            return lin, ang
+        nlin, nang = self._nav_cmd
+        return (
+            0.72 * lin + 0.28 * nlin,
+            0.65 * ang + 0.35 * nang,
+        )
+
     def _tick(self) -> None:
         msg = Twist()
         if self._session_active:
@@ -257,7 +329,7 @@ class RoverBrain(Node):
                 if in_hall:
                     self._explore.leave_recover_for_hallway()
                     hw = Twist()
-                    self._ensure_hallway().fill_twist(hw)
+                    self._ensure_hallway().fill_corridor_reaction(hw)
                     lin, ang = hw.linear.x, hw.angular.z
                 if in_hall != self._in_corridor:
                     self._in_corridor = in_hall
@@ -265,8 +337,10 @@ class RoverBrain(Node):
                         self.get_logger().info('hallway: existing center — steer off the closer wall, no reverse')
                     else:
                         self.get_logger().info('hallway: walls gone — back to explore')
-                msg.linear.x = lin
-                msg.angular.z = ang
+                lin, ang = self._explore._proximity.cap_forward_l8(
+                    lin, ang, max_steer=float(os.environ.get('ROVER_AUTO_MAX_ANGULAR', '0.18'))
+                )
+                msg.linear.x, msg.angular.z = self._blend_nav(lin, ang)
         now = time.monotonic()
         dt = now - self._slew_t
         self._slew_t = now
@@ -280,6 +354,18 @@ class RoverBrain(Node):
         )
         msg.linear.x = lin
         msg.angular.z = ang
+        # Wheel stall only on straight cruise — turns + escape arcs look "stalled"
+        # to tick math and were spamming reverse→spin-right loops.
+        if (
+            self._session_active
+            and self._explore.allows_wheel_stall_check()
+            and abs(ang) < 0.04
+            and lin > 0.07
+            and self._wheels.check_stall(lin, ang, time.monotonic())
+        ):
+            if not self._wheels.wheels_turning():
+                self.get_logger().info('wheel stall — straight cruise, ticks stopped')
+                self._explore.on_stall()
         self.pub.publish(msg)
         self._publish_cal_sweep()
 

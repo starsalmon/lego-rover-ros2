@@ -37,11 +37,14 @@ class LocalHeadingMemory:
         self._leg = 0.0
 
     def note_progress(
-        self, lin: float, dt: float, yaw_rad: float, *, front_open: bool = False
+        self, lin: float, dt: float, yaw_rad: float, *, front_open: bool = False,
+        travel_m: float | None = None,
     ) -> None:
         self._decay()
         if lin > 0.05 and dt > 0.0:
-            self._leg += lin * dt
+            step = travel_m if travel_m is not None else lin * dt
+            if step > 0.0:
+                self._leg += step
             # Only forgive a heading if we actually drove into open space.
             if self._leg >= 0.50 and front_open:
                 i = self._bin(math.degrees(yaw_rad))

@@ -160,11 +160,18 @@ class HallwayFollow:
             return False
 
         comfort = 0.38
+        deadband = 0.08
         max_ang = 0.04
         ang = 0.0
-        if self._left_m < comfort:
+        if abs(self._left_m - self._right_m) < deadband:
+            ang = 0.0
+        elif self._left_m < comfort and (
+            self._left_m < self._right_m - deadband
+        ):
             ang -= max_ang * min(1.0, (comfort - self._left_m) / 0.20)
-        if self._right_m < comfort:
+        elif self._right_m < comfort and (
+            self._right_m < self._left_m - deadband
+        ):
             ang += max_ang * min(1.0, (comfort - self._right_m) / 0.20)
         ang = max(-max_ang, min(max_ang, ang))
         if abs(ang) < 0.022:
@@ -203,28 +210,22 @@ class HallwayFollow:
         # Do not reverse here. A reverse in a hall hits the tail sonar, which
         # zeros it, and the ESP then drops the turn — the robot just sits.
         if left_ok and right_ok and self.cfg.wall in ('auto', 'center'):
-            err = self._right_m - self._left_m
-            if abs(err) < 0.04:
-                err = 0.0
-            now_s = time.monotonic()
-            d_term = 0.0
-            if self._side_prev is not None:
-                dt = now_s - self._side_prev[0]
-                if 0.05 <= dt <= 0.8:
-                    d_l = -(self._left_m - self._side_prev[1]) / dt
-                    d_r = -(self._right_m - self._side_prev[2]) / dt
-                    d_term = 0.40 * (max(0.0, d_r) - max(0.0, d_l))
-            self._side_prev = (now_s, self._left_m, self._right_m)
-            raw = -0.55 * err + d_term
-            self._ang_filt = 0.72 * self._ang_filt + 0.28 * raw
-            ang = max(-self.cfg.max_ang, min(self.cfg.max_ang, self._ang_filt))
-            # Below 0.04 the ESP heading-hold stays on and walks into the wall.
-            if abs(err) >= 0.06 and abs(ang) < 0.05:
-                ang = math.copysign(0.05, ang if ang != 0.0 else -err)
-
-            lin = max(0.12, min(self.cfg.cruise, 0.14))
-            pinch = min(self._left_m, self._right_m)
-            if pinch < 0.20:
+            # Drive the hall. A small offset is not a turn. Only nudge off a hip
+            # that is actually close, and keep forward much larger than the steer
+            # so it does not circle.
+            sl, sr = self._left_m, self._right_m
+            ang = 0.0
+            comfort = 0.40
+            if sl < comfort or sr < comfort:
+                if sl < sr:
+                    ang = -0.045
+                elif sr < sl:
+                    ang = 0.045
+                closer = min(sl, sr)
+                if closer < 0.28:
+                    ang = math.copysign(0.07, ang if ang != 0.0 else (1.0 if sr < sl else -1.0))
+            lin = 0.14
+            if min(sl, sr) < 0.24:
                 lin = 0.12
             msg.linear.x = lin
             msg.angular.z = ang

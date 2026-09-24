@@ -18,10 +18,10 @@ def _env_float(name: str, default: float) -> float:
 class CmdVelSlew:
     """Slew-filter for normalized linear.x / angular.z cmd_vel."""
 
-    lin_accel: float = 0.45
-    lin_brake: float = 0.80
-    ang_accel: float = 0.28
-    ang_brake: float = 0.45
+    lin_accel: float = 0.35
+    lin_brake: float = 0.28
+    ang_accel: float = 0.10
+    ang_brake: float = 0.18
     rest_eps: float = 0.012
     lin_out: float = 0.0
     ang_out: float = 0.0
@@ -29,10 +29,10 @@ class CmdVelSlew:
     @classmethod
     def from_env(cls) -> CmdVelSlew:
         return cls(
-            lin_accel=_env_float('CMD_SLEW_LIN_ACCEL', 0.45),
-            lin_brake=_env_float('CMD_SLEW_LIN_BRAKE', 0.80),
-            ang_accel=_env_float('CMD_SLEW_ANG_ACCEL', 0.28),
-            ang_brake=_env_float('CMD_SLEW_ANG_BRAKE', 0.45),
+            lin_accel=_env_float('CMD_SLEW_LIN_ACCEL', 0.35),
+            lin_brake=_env_float('CMD_SLEW_LIN_BRAKE', 0.28),
+            ang_accel=_env_float('CMD_SLEW_ANG_ACCEL', 0.10),
+            ang_brake=_env_float('CMD_SLEW_ANG_BRAKE', 0.18),
         )
 
     def reset(self) -> None:
