@@ -15,6 +15,7 @@ from typing import Callable
 
 from rover_proximity import ProximityState
 from rover_local_memory import LocalHeadingMemory
+from rover_motion import ExploreMotionHints
 
 # ESP spin-in-place when |linear| < ~0.08 and |angular| > 0.02 — creep forward when steering.
 # This must be slow (otherwise we "creep-turn" into skirting/legs).
@@ -223,6 +224,13 @@ class ExploreController:
         self._bump_pending = False
         self._stall_pending = False
         self._wheel_travel_m = 0.0
+        self._wheels_moving = False
+        self._motion_hints = ExploreMotionHints(
+            allow_shaping=False,
+            in_corridor=False,
+            along_wall=False,
+            sonar_front=_sonar_front(),
+        )
         self._scan_done = False
         self._ir_front_cooldown_until = 0.0
         self._ir_fl = False
@@ -292,6 +300,9 @@ class ExploreController:
 
     def on_stall(self) -> None:
         self._stall_pending = True
+
+    def set_wheels_moving(self, moving: bool) -> None:
+        self._wheels_moving = bool(moving)
 
     def add_wheel_travel(self, delta_m: float) -> None:
         if delta_m > 0.0:
@@ -411,12 +422,6 @@ class ExploreController:
 
     def allows_wheel_stall_check(self) -> bool:
         return self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST)
-
-    def leave_recover_for_hallway(self) -> None:
-        if self.mode == Mode.RECOVER:
-            self._enter(Mode.CRUISE, 6.0)
-            self._recover_sign = 0.0
-            self._recover_phase = RecoverPhase.REVERSE
 
     def on_imu(self, gz_rad_s: float) -> None:
         now = time.monotonic()
@@ -813,13 +818,14 @@ class ExploreController:
             if not stall_in_recover_reverse:
                 self._trigger_escape()
 
-        # Oscillation + a blocked nose: reverse straight, then peel. No sit-and-scan.
+        # Recover only when nose is in the wall AND wheels are not making progress.
         if self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST) and now >= self._event_ignore_until:
-            if self._proximity.in_corridor():
-                pass
-            elif self._imu_oscillating(now) and self._proximity.is_forward_blocked():
-                self._start_recover(now, reason="oscillation")
-            elif self._proximity.is_nose_jammed() or self._proximity.wants_early_turn():
+            if (
+                not self._proximity.in_corridor()
+                and self._proximity.is_nose_jammed()
+                and not self._wheels_moving
+                and self._wheel_travel_m < 0.06
+            ):
                 self._start_recover(now, reason="l8 close")
 
         if self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST) and now >= self.mode_until:
@@ -855,35 +861,34 @@ class ExploreController:
             lin, ang = self._tick_recover(now)
 
         scanning = now < self._scan_until
-
-        # Tier-1 shaping: slow + steer-away in open room. Never hard-stop here —
-        # ESP owns the forward brake; brain just biases away early.
-        if (not scanning) and self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST):
-            lin, ang = self._proximity.cap_forward_l8(lin, ang, max_steer=_max_steer())
-            if _sonar_front() and not self._proximity.in_corridor():
-                lin, ang = self._proximity.apply(lin, ang, max_steer=_max_steer())
+        in_corridor = self.react_corridor()
+        cruise_modes = self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST)
+        steer_commit = 0.0
+        memory_ang = 0.0
+        radar_ang = 0.0
+        if (not scanning) and cruise_modes:
             if not self._proximity.along_wall():
-                commit = self._proximity.steer_commit_active(now)
-                if commit != 0.0:
-                    ang = max(-_max_steer(), min(_max_steer(), ang + commit * _max_steer() * 0.22))
-                mem = self._memory.cruise_bias(self._yaw_integrated, _max_steer())
-                if abs(mem) >= 0.02:
-                    ang = max(-_max_steer(), min(_max_steer(), ang + mem))
-                    lin = min(lin, _max_linear() * 0.60)
-
-        if (not scanning) and self._bg_radar and self.mode in (
-            Mode.CRUISE, Mode.WANDER, Mode.BURST
-        ) and not self._proximity.along_wall() and not self._proximity.in_corridor():
-            ang += self._bg_radar.steer_bias()
-
-        if not scanning:
-            if self.react_corridor():
-                lin, ang = self._proximity.corridor_drive(_max_linear())
-            else:
+                steer_commit = self._proximity.steer_commit_active(now)
+                memory_ang = self._memory.cruise_bias(self._yaw_integrated, _max_steer())
+            if (
+                self._bg_radar
+                and not self._proximity.along_wall()
+                and not in_corridor
+            ):
+                radar_ang = self._bg_radar.steer_bias()
+            if not in_corridor:
                 lin, ang = self._apply_front_stop(lin, ang, front_blocked)
-                lin, ang = self._proximity.repel_overlay(lin, ang, max_steer=_max_steer())
-                if not self._proximity.must_pivot():
-                    lin, ang = _arc_not_spin(lin, ang)
+
+        self._motion_hints = ExploreMotionHints(
+            allow_shaping=(not scanning) and cruise_modes,
+            in_corridor=in_corridor,
+            along_wall=self._proximity.along_wall(),
+            sonar_front=_sonar_front(),
+            steer_commit=steer_commit,
+            memory_ang=memory_ang,
+            radar_ang=radar_ang,
+            front_blocked=front_blocked,
+        )
 
         # Scan finished: commit toward a real opening, never a coin-flip.
         if self._scan_until > 0.0 and now >= self._scan_until and (now - self._scan_started) < 6.0:
@@ -913,22 +918,6 @@ class ExploreController:
                 )
             self._scan_until = 0.0
 
-        # Always slew, including escape/avoid/scan. Skipping slew is how jerk
-        # and the left/right waggle come back after a "perfect" week.
-        dt = 0.05
-        lin_tgt = lin
-        ang_tgt = ang
-        if self._out_lin * lin < 0.0 and abs(self._out_lin) > 0.03:
-            lin_tgt = 0.0
-        if self._out_ang * ang < 0.0 and abs(self._out_ang) > 0.02:
-            ang_tgt = 0.0
-        dlin = (LIN_BRAKE_SLEW_PER_S if abs(lin_tgt) < abs(self._out_lin) else LIN_SLEW_PER_S) * dt
-        dang = (ANG_BRAKE_SLEW_PER_S if abs(ang_tgt) < abs(self._out_ang) else ANG_SLEW_PER_S) * dt
-        lin = max(self._out_lin - dlin, min(self._out_lin + dlin, lin_tgt))
-        ang = max(self._out_ang - dang, min(self._out_ang + dang, ang_tgt))
-        self._out_lin = lin
-        self._out_ang = ang
-
         # Avoid pivot-style spins: as we slow down, clamp angular to stay arc-like.
         if self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST):
             max_ang = min(_max_steer(), 0.08 + abs(lin) * 1.35)
@@ -944,6 +933,7 @@ class ExploreController:
         self._out_lin = lin
         self._out_ang = ang
         self._last_driving = lin > 0.05
+        dt = 0.05  # brain tick period (rover_brain.TICK)
         if self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST) or (
             self.mode == Mode.RECOVER and self._recover_phase == RecoverPhase.DRIVE_OUT
         ):

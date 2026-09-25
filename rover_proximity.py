@@ -124,6 +124,8 @@ class ProximityState:
     _l8_open_m: float = 3.0
     _corr_filt: float = 0.0
     _corridor_seen: float = 0.0
+    _corridor_latched: bool = False
+    _corridor_exit_since: float = 0.0
 
     def update_pan(self, pan_deg: float) -> None:
         self._pan_deg = float(pan_deg)
@@ -325,22 +327,33 @@ class ProximityState:
         return False
 
     def in_corridor(self) -> bool:
-        """Both hips see walls. Latch briefly so one VL53 dropout does not flap."""
+        """Both hips see walls. Enter fast, exit only after sustained open gap."""
         sl = self._side_clear('left')
         sr = self._side_clear('right')
-        both = (
-            not math.isnan(sl)
-            and not math.isnan(sr)
-            and sl < self.cfg.side_corridor_max_m
-            and sr < self.cfg.side_corridor_max_m
-        )
+        if math.isnan(sl) or math.isnan(sr):
+            return self._corridor_latched
+        enter_m = self.cfg.side_corridor_max_m
+        exit_m = enter_m + 0.22
         now = time.monotonic()
-        if both:
+        both_close = sl < enter_m and sr < enter_m
+        both_far = sl > exit_m and sr > exit_m
+        if both_close:
+            self._corridor_latched = True
+            self._corridor_exit_since = 0.0
             self._corridor_seen = now
             return True
-        if self._corridor_seen > 0.0 and (now - self._corridor_seen) < 3.0:
-            return True
-        return False
+        if not self._corridor_latched:
+            return False
+        if both_far:
+            if self._corridor_exit_since <= 0.0:
+                self._corridor_exit_since = now
+            elif (now - self._corridor_exit_since) >= 2.0:
+                self._corridor_latched = False
+                self._corridor_exit_since = 0.0
+                return False
+        else:
+            self._corridor_exit_since = 0.0
+        return True
 
     def wall_dead_end(self) -> bool:
         """Really boxed in: nose close and both hips tight."""
@@ -435,13 +448,23 @@ class ProximityState:
 
     def corridor_drive(self, cruise: float) -> tuple[float, float]:
         """Hallway: hold the gap. Nudge off a closing hip so heading-hold cannot walk in."""
-        lin = max(0.11, min(0.14, cruise))
-        ang = self.hip_repel(0.05)
+        lin = max(0.10, min(0.12, cruise * 0.85))
+        ang = self.hip_repel(0.035)
         sl = self._side_clear('left')
         sr = self._side_clear('right')
         vals = [v for v in (sl, sr) if not math.isnan(v)]
         if vals and min(vals) < 0.22:
-            lin = min(lin, 0.11)
+            lin = min(lin, 0.09)
+        fwd = self.front_center_m()
+        if math.isnan(fwd):
+            fwd = self.l8_col_min()
+        if not math.isnan(fwd):
+            if fwd < 0.45:
+                lin = min(lin, max(0.07, 0.05 + fwd * 0.18))
+            if fwd < 0.55 and abs(ang) < 0.02:
+                gap = self.l8_gap_steer(0.04)
+                if abs(gap) >= 0.015:
+                    ang = gap
         return lin, ang
 
     def corridor_steer(self, max_steer: float) -> float:
@@ -793,17 +816,37 @@ class ProximityState:
         if math.isnan(fwd):
             return lin, ang
         cfg = self.cfg
-        if fwd >= cfg.l8_slow_m:
-            return lin, ang
         if fwd < cfg.l8_turn_m:
             gap = self.l8_gap_steer(max_steer)
             if abs(gap) >= 0.02:
-                ang = max(-max_steer, min(max_steer, gap))
+                blend = 0.35 if self.in_corridor() else 0.55
+                ang = max(-max_steer, min(max_steer, (1.0 - blend) * ang + blend * gap))
+        if fwd >= cfg.l8_slow_m:
+            return lin, ang
         if fwd < cfg.l8_stop_m:
             lin = min(lin, max(0.06, lin * 0.30))
         else:
             scale = (fwd - cfg.l8_stop_m) / max(0.08, cfg.l8_slow_m - cfg.l8_stop_m)
             lin = min(lin, lin * max(0.22, min(1.0, scale)))
+        return lin, ang
+
+    def cap_turn_l8(self, lin: float, ang: float, *, max_steer: float) -> tuple[float, float]:
+        """While turning, ease off if L8 columns on the inside of the arc are close."""
+        if abs(ang) < 0.025:
+            return lin, ang
+        if (time.monotonic() - self._l8_cols_ms) > 0.6:
+            return lin, ang
+        side = self._l8_cols[:3] if ang > 0.0 else self._l8_cols[5:8]
+        vals = [v for v in side if not math.isnan(v)]
+        if not vals:
+            return lin, ang
+        close = min(vals)
+        if close >= 0.40:
+            return lin, ang
+        scale = max(0.20, (close - 0.14) / 0.26)
+        ang = max(-max_steer, min(max_steer, ang * scale))
+        if close < 0.26 and lin > 0.05:
+            lin = min(lin, 0.09)
         return lin, ang
 
     def apply(self, lin: float, ang: float, *, max_steer: float) -> tuple[float, float]:

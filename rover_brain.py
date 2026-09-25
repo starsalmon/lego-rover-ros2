@@ -21,6 +21,7 @@ from explore_controller import ExploreController
 from hallway_follow import HallwayConfig, HallwayFollow
 from rover_qos import CMD_VEL_QOS
 from cmd_vel_slew import CmdVelSlew
+from rover_motion import shape_explore_cmd
 from rover_wheel_odom import WheelOdometry
 
 BTN_ESTOP_LONG = 3
@@ -64,7 +65,6 @@ class RoverBrain(Node):
         self._front_c = float('nan')
         self._front_l = float('nan')
         self._front_r = float('nan')
-        self._in_corridor = False
         self._nav2 = os.environ.get('ROVER_NAV2', '0').strip().lower() in ('1', 'true', 'yes')
         self._nav_cmd = (0.0, 0.0)
         self._nav_cmd_t = 0.0
@@ -324,21 +324,17 @@ class RoverBrain(Node):
             if self._wall_follow():
                 self._ensure_hallway().fill_twist(msg)
             else:
+                self._explore.set_wheels_moving(self._wheels.wheels_turning())
                 lin, ang = self._explore.tick()
-                in_hall = self._explore.react_corridor()
-                if in_hall:
-                    self._explore.leave_recover_for_hallway()
-                    hw = Twist()
-                    self._ensure_hallway().fill_corridor_reaction(hw)
-                    lin, ang = hw.linear.x, hw.angular.z
-                if in_hall != self._in_corridor:
-                    self._in_corridor = in_hall
-                    if in_hall:
-                        self.get_logger().info('hallway: existing center — steer off the closer wall, no reverse')
-                    else:
-                        self.get_logger().info('hallway: walls gone — back to explore')
-                lin, ang = self._explore._proximity.cap_forward_l8(
-                    lin, ang, max_steer=float(os.environ.get('ROVER_AUTO_MAX_ANGULAR', '0.18'))
+                steer_cap = float(os.environ.get('ROVER_AUTO_MAX_ANGULAR', '0.18'))
+                lin_cap = float(os.environ.get('ROVER_AUTO_MAX_LINEAR', '0.14'))
+                lin, ang = shape_explore_cmd(
+                    self._explore._proximity,
+                    lin,
+                    ang,
+                    hints=self._explore._motion_hints,
+                    max_lin=lin_cap,
+                    max_steer=steer_cap,
                 )
                 msg.linear.x, msg.angular.z = self._blend_nav(lin, ang)
         now = time.monotonic()

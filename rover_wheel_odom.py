@@ -8,6 +8,8 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
+from rover_wheel_cal import load_wheel_cal, save_wheel_cal
+
 
 def _truthy(name: str, default: str = '1') -> bool:
     return os.environ.get(name, default).strip().lower() not in ('0', 'no', 'false')
@@ -40,7 +42,7 @@ def _stall_ms() -> float:
 
 
 def _stall_grace_ms() -> float:
-    return max(0.0, float(os.environ.get('ROVER_WHEEL_STALL_GRACE_MS', '350'))) / 1000.0
+    return max(0.0, float(os.environ.get('ROVER_WHEEL_STALL_GRACE_MS', '500'))) / 1000.0
 
 
 def _stall_cooldown_ms() -> float:
@@ -58,6 +60,14 @@ def _stall_min_ang() -> float:
 def _stall_min_rate() -> float:
     """Min combined wheel tick rate (ticks/s) expected while driving."""
     return max(0.2, float(os.environ.get('ROVER_WHEEL_STALL_MIN_RATE', '2.0')))
+
+
+def _stall_cal_min_samples() -> int:
+    return max(4, int(os.environ.get('ROVER_WHEEL_CAL_MIN_SAMPLES', '8')))
+
+
+def _stall_slip_ratio() -> float:
+    return max(0.10, min(0.50, float(os.environ.get('ROVER_WHEEL_STALL_SLIP_RATIO', '0.25'))))
 
 
 @dataclass(frozen=True)
@@ -101,13 +111,22 @@ class WheelOdometry:
         self._last_stall_mono = 0.0
         self._ticks_per_cmd = 0.0
         self._cal_n = 0
+        loaded_ticks, loaded_n = load_wheel_cal()
+        if loaded_ticks > 0.5:
+            self._ticks_per_cmd = loaded_ticks
+            self._cal_n = max(_stall_cal_min_samples(), loaded_n)
 
     def config_summary(self) -> str:
+        cal = f', stall cal {self._ticks_per_cmd:.1f} ticks/cmd' if self._cal_n else ', stall cal pending'
         return (
             f'{self._strips} strips/rev, '
             f'{self._m_per_tick * 1000:.2f} mm/tick, '
             f'track {_track_m() * 1000:.0f} mm'
+            f'{cal}'
         )
+
+    def cal_status(self) -> tuple[float, int]:
+        return self._ticks_per_cmd, self._cal_n
 
     def on_left(self, ticks: int) -> None:
         with self._lock:
@@ -200,32 +219,41 @@ class WheelOdometry:
             self._drive_since = now
             return False
 
-        if now - self._drive_since < _stall_grace_ms():
-            return False
-
         snap = self.snapshot()
         if not snap.ticks_ok:
             return False
 
-        combined_rate = abs(snap.left_rate) + abs(snap.right_rate)
         cmd_mag = max(abs(cmd_lin), abs(cmd_ang))
-        if combined_rate >= 1.0 and cmd_mag >= _stall_min_lin():
+        grace = _stall_grace_ms() * max(1.0, _stall_min_lin() / max(cmd_mag, _stall_min_lin()))
+        if now - self._drive_since < grace:
+            return False
+
+        combined_rate = abs(snap.left_rate) + abs(snap.right_rate)
+        straight = abs(cmd_ang) < 0.03 and cmd_lin >= _stall_min_lin()
+        if straight and combined_rate >= 1.0 and cmd_mag >= _stall_min_lin():
             observed = combined_rate / cmd_mag
             if self._cal_n == 0:
                 self._ticks_per_cmd = observed
             else:
                 self._ticks_per_cmd = 0.85 * self._ticks_per_cmd + 0.15 * observed
             self._cal_n = min(255, self._cal_n + 1)
+            if self._cal_n in (8, 16, 32):
+                try:
+                    save_wheel_cal(self._ticks_per_cmd, self._cal_n)
+                except OSError:
+                    pass
 
-        if self._cal_n >= 4 and self._ticks_per_cmd > 0.5:
+        min_cal = _stall_cal_min_samples()
+        if self._cal_n >= min_cal and self._ticks_per_cmd > 0.5:
             expect = self._ticks_per_cmd * cmd_mag
-            floor = max(0.6, 0.30 * expect)
+            floor = max(0.6, _stall_slip_ratio() * expect)
         else:
             floor = _stall_min_rate()
         if combined_rate >= floor:
             return False
 
-        if now - self._drive_since < _stall_ms():
+        stall_window = _stall_ms() * max(1.0, _stall_min_lin() / max(cmd_mag, _stall_min_lin()))
+        if now - self._drive_since < stall_window:
             return False
 
         self._last_stall_mono = now
