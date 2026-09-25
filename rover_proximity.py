@@ -36,8 +36,8 @@ class ProximityConfig:
     side_slow_m: float = 0.32
     # Peel before the body is already on the skirting.
     side_comfort_m: float = 0.45
-    # Both side ToFs closer than this → treat as a corridor and center.
-    side_corridor_max_m: float = 1.40
+    # Both side ToFs closer than this → treat as a corridor (not wide rooms).
+    side_corridor_max_m: float = 1.15
     # Nose L8 is a 4 m camera, not a bumper. Slow/turn long before ESP's 0.24 m brake.
     l8_slow_m: float = 0.85
     l8_turn_m: float = 0.55
@@ -65,7 +65,7 @@ class ProximityConfig:
             side_stop_m=_f('ROVER_SIDE_STOP_M', 0.12),
             side_slow_m=_f('ROVER_SIDE_SLOW_M', 0.32),
             side_comfort_m=_f('ROVER_SIDE_COMFORT_M', 0.45),
-            side_corridor_max_m=_f('ROVER_SIDE_CORRIDOR_MAX_M', 1.40),
+            side_corridor_max_m=_f('ROVER_SIDE_CORRIDOR_MAX_M', 1.15),
             l8_slow_m=_f('ROVER_L8_SLOW_M', 0.85),
             l8_turn_m=_f('ROVER_L8_TURN_M', 0.55),
             l8_stop_m=_f('ROVER_L8_STOP_M', 0.34),
@@ -126,6 +126,7 @@ class ProximityState:
     _corridor_seen: float = 0.0
     _corridor_latched: bool = False
     _corridor_exit_since: float = 0.0
+    _corridor_ang_filt: float = 0.0
 
     def update_pan(self, pan_deg: float) -> None:
         self._pan_deg = float(pan_deg)
@@ -350,6 +351,7 @@ class ProximityState:
             elif (now - self._corridor_exit_since) >= 2.0:
                 self._corridor_latched = False
                 self._corridor_exit_since = 0.0
+                self._corridor_ang_filt = 0.0
                 return False
         else:
             self._corridor_exit_since = 0.0
@@ -447,24 +449,49 @@ class ProximityState:
         return ang
 
     def corridor_drive(self, cruise: float) -> tuple[float, float]:
-        """Hallway: hold the gap. Nudge off a closing hip so heading-hold cannot walk in."""
-        lin = max(0.10, min(0.12, cruise * 0.85))
-        ang = self.hip_repel(0.035)
+        """Hallway: drive forward, nudge off a close hip only.
+
+        Do not equalize left/right ToF — yaw makes the outside sensor read longer
+        and that steers harder into the wall. Matches hallway_follow bench logic.
+        """
         sl = self._side_clear('left')
         sr = self._side_clear('right')
-        vals = [v for v in (sl, sr) if not math.isnan(v)]
-        if vals and min(vals) < 0.22:
+        if math.isnan(sl) or math.isnan(sr):
+            lin = max(0.12, min(0.14, cruise))
+            return lin, 0.0
+
+        pinch = min(sl, sr)
+        deadband = 0.06 if pinch < 0.32 else 0.10
+        comfort = 0.38
+        max_ang = 0.042 if pinch < 0.32 else 0.035
+        lead = deadband * 0.5
+        ang = 0.0
+        if abs(sl - sr) < deadband:
+            ang = 0.0
+        elif sl < comfort and sl < sr - lead:
+            ang -= max_ang * min(1.0, (comfort - sl) / 0.22)
+        elif sr < comfort and sr < sl - lead:
+            ang += max_ang * min(1.0, (comfort - sr) / 0.22)
+        ang = max(-max_ang, min(max_ang, ang))
+        if abs(ang) < 0.018:
+            ang = 0.0
+
+        self._corridor_ang_filt = 0.72 * self._corridor_ang_filt + 0.28 * ang
+        if abs(self._corridor_ang_filt) < 0.015:
+            self._corridor_ang_filt = 0.0
+        ang = self._corridor_ang_filt
+
+        lin = max(0.12, min(0.14, cruise))
+        if pinch < 0.28:
+            lin = min(lin, 0.10)
+        if pinch < 0.22:
             lin = min(lin, 0.09)
+
         fwd = self.front_center_m()
         if math.isnan(fwd):
             fwd = self.l8_col_min()
-        if not math.isnan(fwd):
-            if fwd < 0.45:
-                lin = min(lin, max(0.07, 0.05 + fwd * 0.18))
-            if fwd < 0.55 and abs(ang) < 0.02:
-                gap = self.l8_gap_steer(0.04)
-                if abs(gap) >= 0.015:
-                    ang = gap
+        if not math.isnan(fwd) and fwd < 0.50:
+            lin = min(lin, max(0.08, 0.05 + fwd * 0.16))
         return lin, ang
 
     def corridor_steer(self, max_steer: float) -> float:

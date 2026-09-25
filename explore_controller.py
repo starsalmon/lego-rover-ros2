@@ -694,6 +694,10 @@ class ExploreController:
 
         if not (self._bump_pending or self._stall_pending):
             return
+        # In a hall, stall is usually ESP nose brake — reverse+arc U-turns the bot.
+        if self._proximity.in_corridor() and self._stall_pending and not self._bump_pending:
+            self._stall_pending = False
+            return
         if self.mode == Mode.ESCAPE:
             return
         if now < self._event_ignore_until:
@@ -736,13 +740,31 @@ class ExploreController:
         now = time.monotonic()
         spin_deg = random.uniform(SPIN_DEG_MIN, SPIN_DEG_MAX)
         sign, confident = self._proximity.live_opening_sign()
-        if confident and sign != 0.0:
+        in_hall = self._proximity.in_corridor()
+        spin_dir = 0.0
+        if in_hall:
+            sl = self._proximity._side_clear('left')
+            sr = self._proximity._side_clear('right')
+            if not math.isnan(sl) and not math.isnan(sr):
+                if sl > sr + 0.05:
+                    spin_dir, confident = 1.0, True
+                elif sr > sl + 0.05:
+                    spin_dir, confident = -1.0, True
+            if not confident:
+                hip = self._proximity.turn_away_from_closest()
+                if hip != 0.0:
+                    spin_dir, confident = hip, True
+            if spin_dir == 0.0:
+                spin_dir = self._proximity.turn_away_from_closest() or -self._escape_spin_sign
+            spin_deg = min(32.0, SPIN_DEG_MIN + 8.0)
+            steer = min(0.045, steer)
+        elif confident and sign != 0.0:
             spin_dir = sign
         else:
             spin_dir = random.choice([-1.0, 1.0]) * self._escape_spin_sign
         bearing = -1.0
 
-        if self._bg_radar is not None:
+        if self._bg_radar is not None and not in_hall:
             hits, _ = self._bg_radar.get_hits()
             if hits and not all(hits):
                 try:
@@ -756,7 +778,10 @@ class ExploreController:
                 except Exception:
                     pass
 
-        duration = max(1.2, min(2.8, spin_deg / 40.0))
+        if in_hall:
+            duration = max(0.7, min(1.4, spin_deg / 45.0))
+        else:
+            duration = max(1.2, min(2.8, spin_deg / 40.0))
         if bearing >= 0:
             self._log(
                 f'escape arc {bearing:.0f}° gap → {spin_deg:.0f}° '
@@ -805,7 +830,11 @@ class ExploreController:
         self._maybe_start_scan(now)
 
         if _front_ir_stop() and self.mode not in (Mode.ESCAPE, Mode.AVOID):
-            if self._front_blocked() and now >= self._ir_front_cooldown_until:
+            if (
+                self._front_blocked()
+                and now >= self._ir_front_cooldown_until
+                and not self._proximity.in_corridor()
+            ):
                 self._trigger_front_avoid(now)
 
         if self._bump_pending or self._stall_pending:

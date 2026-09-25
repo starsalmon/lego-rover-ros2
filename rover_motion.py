@@ -54,7 +54,7 @@ def shape_explore_cmd(
 
     if hints.in_corridor:
         lin, ang = prox.corridor_drive(max_lin)
-        # Corridor already folds L8 + hips — skip second cap that fights centering.
+        # Corridor: forward bias, tiny steer — do not layer L8 gap-steer or repel.
         return lin, ang
     else:
         lin, ang = prox.repel_overlay(lin, ang, max_steer=max_steer)
