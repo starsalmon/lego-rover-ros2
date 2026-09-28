@@ -23,6 +23,7 @@ from rover_qos import CMD_VEL_QOS
 from cmd_vel_slew import CmdVelSlew
 from rover_motion import shape_explore_cmd
 from rover_wheel_odom import WheelOdometry
+from fleet_meet_spin import MeetSpinController
 
 BTN_ESTOP_LONG = 3
 DRIVE_EXPLORE = 0
@@ -62,6 +63,9 @@ class RoverBrain(Node):
         self._wheels = WheelOdometry()
         self._wheel_dist_m = 0.0
         self.get_logger().info(f'wheel odom: {self._wheels.config_summary()}')
+        self._meet = MeetSpinController(fleet_id=0)
+        self._meet_was_active = False
+        self._last_imu_t = time.monotonic()
         self._front_c = float('nan')
         self._front_l = float('nan')
         self._front_r = float('nan')
@@ -94,6 +98,7 @@ class RoverBrain(Node):
         self.create_subscription(Range, '/rover/tof/front_right', self._on_tof_front_right, 10)
         self.create_subscription(Float32MultiArray, '/rover/tof/l8_cols', self._on_l8_cols, 10)
         self.create_subscription(UInt8, '/rover/ir/hits', self._on_ir_hits, 10)
+        self.create_subscription(UInt8, '/rover/ir/peer', self._on_ir_peer, 10)
 
         self.create_timer(self.TICK, self._tick)
         self.create_timer(self.HEARTBEAT_PERIOD, self._send_heartbeat)
@@ -207,9 +212,18 @@ class RoverBrain(Node):
         if not self._wall_follow() and self._session_active:
             self._explore.on_sonar_avoid(active)
 
+    def _on_ir_peer(self, msg: UInt8) -> None:
+        if self._session_active:
+            self._meet.on_peer(int(msg.data))
+
     def _on_imu(self, msg: Imu) -> None:
+        now = time.monotonic()
+        dt = now - self._last_imu_t
+        self._last_imu_t = now
+        gz = float(msg.angular_velocity.z)
+        self._meet.on_imu_gz(gz, dt)
         if not self._wall_follow() and self._session_active:
-            self._explore.on_imu(float(msg.angular_velocity.z))
+            self._explore.on_imu(gz)
 
     def _on_bump(self, msg: Bool) -> None:
         if not msg.data or self._wall_follow() or not self._session_active:
@@ -320,7 +334,19 @@ class RoverBrain(Node):
 
     def _tick(self) -> None:
         msg = Twist()
-        if self._session_active:
+        meet_cmd = self._meet.tick()
+        meet_ok = self._session_active or self._meet.active
+        if meet_cmd is not None and meet_ok:
+            if not self._meet_was_active:
+                self.get_logger().info(
+                    f'meet dance — saw {self._meet.peer_label()}, spinning 2×360°'
+                )
+            self._meet_was_active = True
+            msg.linear.x, msg.angular.z = meet_cmd
+        elif self._meet_was_active:
+            self._meet_was_active = False
+            self.get_logger().info('meet dance done')
+        elif self._session_active:
             if self._wall_follow():
                 self._ensure_hallway().fill_twist(msg)
             else:
@@ -356,7 +382,8 @@ class RoverBrain(Node):
             self._session_active
             and self._explore.allows_wheel_stall_check()
             and abs(ang) < 0.04
-            and lin > 0.07
+            and lin > 0.12
+            and not self._meet.active
             and self._wheels.check_stall(lin, ang, time.monotonic())
         ):
             if not self._wheels.wheels_turning():
