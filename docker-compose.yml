@@ -1,0 +1,234 @@
+# Robot fleet — dockerhost runs this stack; bots connect over WiFi micro-ROS.
+#   docker compose up -d
+# Starts: agent + explore/chase brain + ROS CLI shell (no per-command containers).
+
+services:
+  microros-agent:
+    image: microros/micro-ros-agent:jazzy
+    container_name: microros-agent
+    network_mode: host
+    command: ["udp4", "--port", "8888"]
+    restart: unless-stopped
+
+  fleet-brain:
+    image: ros:jazzy-ros-base
+    container_name: fleet-brain
+    network_mode: host
+    depends_on:
+      - microros-agent
+    volumes:
+      - .:/opt/fleet:ro
+    environment:
+      - ROS_DOMAIN_ID=0
+      - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/fleet/fastdds_udp.xml
+      - BOT_NS=${BOT_NS:-bot1}
+      - WANDER_CRUISE=${WANDER_CRUISE:-0.20}
+      - WANDER_CRUISE_MIN=${WANDER_CRUISE_MIN:-0.14}
+      - WANDER_CRUISE_MAX=${WANDER_CRUISE_MAX:-0.24}
+      - WANDER_BLIND_CRUISE=${WANDER_BLIND_CRUISE:-0.08}
+      - WANDER_CARPET=${WANDER_CARPET:-1}
+      - WANDER_BURST_ENABLE=${WANDER_BURST_ENABLE:-0}
+      - WANDER_STOP_M=${WANDER_STOP_M:-0.14}
+      - WANDER_SLOW_M=${WANDER_SLOW_M:-0.26}
+      - WANDER_CLOSE_M=${WANDER_CLOSE_M:-0.22}
+      - WANDER_AVOID_BACKUP_S=${WANDER_AVOID_BACKUP_S:-0.60}
+      - WANDER_AVOID_COOLDOWN_S=${WANDER_AVOID_COOLDOWN_S:-1.8}
+      - WANDER_COMMIT_CRUISE_S=${WANDER_COMMIT_CRUISE_S:-1.6}
+      - CHASE_CRUISE=${CHASE_CRUISE:-0.24}
+      - WANDER_BURST_SPEED=${WANDER_BURST_SPEED:-0.70}
+      - WANDER_BURST_SEC=${WANDER_BURST_SEC:-1.5}
+      - WANDER_BURST_MIN_INTERVAL=${WANDER_BURST_MIN_INTERVAL:-50}
+      - WANDER_BURST_MAX_INTERVAL=${WANDER_BURST_MAX_INTERVAL:-120}
+      - DRIVE_CSV=/tmp/fleet-drive-log.csv
+      - MEET_PEER_STABLE=3
+      - IMU_CAL_SEC=${IMU_CAL_SEC:-2.5}
+      - IMU_CAL_MIN_SAMPLES=${IMU_CAL_MIN_SAMPLES:-50}
+    command: >
+      bash -c "source /opt/ros/jazzy/setup.bash &&
+      exec python3 /opt/fleet/explore_then_chase.py"
+    restart: unless-stopped
+
+  # Tracked bot (bot2) — wander on connect (no Go button). Slow until ToF is live.
+  tracked-brain:
+    image: ros:jazzy-ros-base
+    container_name: tracked-brain
+    network_mode: host
+    depends_on:
+      - microros-agent
+    volumes:
+      - .:/opt/fleet:ro
+    environment:
+      - ROS_DOMAIN_ID=0
+      - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/fleet/fastdds_udp.xml
+      - BOT_NS=bot2
+      - DRIVE_CSV=/tmp/tracked-drive-log.csv
+      - MEET_PEER_STABLE=3
+      - WANDER_STOP_M=0.12
+      - WANDER_TRAP_COOLDOWN_S=1.2
+      - REQUIRE_IMU=0
+      - WANDER_BLIND_CRUISE=${TRACKED_BLIND_CRUISE:-0.10}
+      - WANDER_CRUISE=${TRACKED_CRUISE:-0.14}
+      - WANDER_CRUISE_MIN=${TRACKED_CRUISE_MIN:-0.10}
+      - WANDER_CRUISE_MAX=${TRACKED_CRUISE_MAX:-0.18}
+      - WANDER_BURST_ENABLE=0
+      - IMU_CAL_SEC=${IMU_CAL_SEC:-2.5}
+      - IMU_CAL_MIN_SAMPLES=${IMU_CAL_MIN_SAMPLES:-50}
+    command: >
+      bash -c "source /opt/ros/jazzy/setup.bash &&
+      exec python3 /opt/fleet/explore_then_chase.py"
+    restart: unless-stopped
+
+  # LEGO rover brain — always on, Go-button gated (standby until tap Go on bot).
+  rover-brain:
+    image: ros:jazzy-ros-base
+    container_name: rover-brain
+    network_mode: host
+    depends_on:
+      - microros-agent
+    volumes:
+      - .:/opt/fleet:ro
+    environment:
+      - ROS_DOMAIN_ID=0
+      - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/fleet/fastdds_udp.xml
+      - ROVER_SONAR=1
+      - ROVER_CRUISE_RADAR=0
+      # Slightly slower default gives the brain time to steer away before ESP braking.
+      - ROVER_AUTO_MAX_LINEAR=${ROVER_AUTO_MAX_LINEAR:-0.16}
+      # 0.10 was too low to steer away early; keep smoothness on ESP ramp,
+      # but allow the brain enough authority to curve away before brake range.
+      - ROVER_AUTO_MAX_ANGULAR=${ROVER_AUTO_MAX_ANGULAR:-0.18}
+      - ROVER_AUTO_REVERSE_FRAC=${ROVER_AUTO_REVERSE_FRAC:-0.60}
+      - ROVER_IMU_GYRO_SIGN=${ROVER_IMU_GYRO_SIGN:-1.0}
+      - ROVER_MODE=${ROVER_MODE:-explore}
+      # No Pro S3 / L8 picture — blind cruise + bump/stall (set 1 to restore ToF steer)
+      - ROVER_PICTURE=1
+      - ROVER_WHEEL_STRIPS=60
+      - ROVER_WHEEL_DIAM_MM=95
+      - ROVER_WHEEL_TRACK_MM=130
+      - ROVER_NAV2=${ROVER_NAV2:-0}
+      - ROVER_WHEEL_STALL=${ROVER_WHEEL_STALL:-1}
+      - ROVER_WHEEL_STALL_GRACE_MS=900
+      - ROVER_WHEEL_STALL_COOLDOWN_MS=5000
+      - MEET_PEER_STABLE=3
+      - ROVER_WHEEL_CAL_FILE=/opt/fleet/cal/wheel_stall.env
+      - HALLWAY_TARGET_M=${HALLWAY_TARGET_M:-0.28}
+      - HALLWAY_CRUISE=${HALLWAY_CRUISE:-0.15}
+      - HALLWAY_KP=${HALLWAY_KP:-3.2}
+      - HALLWAY_WALL=${HALLWAY_WALL:-auto}
+      - HALLWAY_MAX_VALID_M=${HALLWAY_MAX_VALID_M:-2.0}
+      - HALLWAY_TURN_S=${HALLWAY_TURN_S:-7.0}
+    command: >
+      bash -c "source /opt/ros/jazzy/setup.bash &&
+      exec python3 /opt/fleet/rover_brain.py"
+    restart: unless-stopped
+
+  # Nav2 + slam_toolbox. Does not touch /cmd_vel. rover-brain forwards
+  # /cmd_vel_nav only while the Go session is on.
+  rover-nav:
+    profiles: ["nav"]
+    image: rover-nav:jazzy
+    container_name: rover-nav
+    network_mode: host
+    depends_on:
+      - microros-agent
+    volumes:
+      - .:/opt/fleet:ro
+      - ./fastdds_udp.xml:/opt/fleet/fastdds_udp.xml:ro
+    environment:
+      - ROS_DOMAIN_ID=0
+      - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/fleet/fastdds_udp.xml
+      - ROVER_IMU_GYRO_SIGN=${ROVER_IMU_GYRO_SIGN:-1.0}
+      - ROVER_WHEEL_STRIPS=6
+    command: ["bash", "/opt/fleet/rover_nav.sh"]
+    restart: unless-stopped
+
+  # Always-on rover data — hourly ROS bags under ~/rover-bags on dockerhost.
+  rover-record:
+    image: ros:jazzy-ros-base
+    container_name: rover-record
+    network_mode: host
+    depends_on:
+      - microros-agent
+    volumes:
+      - ${ROVER_BAG_DIR:-/root/rover-bags}:/bags
+      - ./rover-record.sh:/opt/fleet/rover-record.sh:ro
+      - ./rover-record-qos.yaml:/opt/fleet/rover-record-qos.yaml:ro
+      - ./fastdds_udp.xml:/opt/fleet/fastdds_udp.xml:ro
+    environment:
+      - ROS_DOMAIN_ID=0
+      - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/fleet/fastdds_udp.xml
+      - ROVER_BAG_DIR=/bags
+      - ROVER_BAG_HOURS=${ROVER_BAG_HOURS:-1}
+      - ROVER_BAG_RETENTION_DAYS=${ROVER_BAG_RETENTION_DAYS:-3}
+    command: ["bash", "/opt/fleet/rover-record.sh"]
+    restart: unless-stopped
+
+  fleet-shell:
+    image: ros:jazzy-ros-base
+    container_name: fleet-shell
+    network_mode: host
+    volumes:
+      - .:/opt/fleet:ro
+    environment:
+      - ROS_DOMAIN_ID=0
+      - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/fleet/fastdds_udp.xml
+    working_dir: /opt/fleet
+    command: ["sleep", "infinity"]
+    restart: unless-stopped
+
+  # Home Assistant MQTT (yoRadio broker). Wall panel: Stop all + battery/online.
+  fleet-ha:
+    build:
+      context: .
+      dockerfile: Dockerfile.ha
+    image: robot-fleet-ha:local
+    container_name: fleet-ha
+    network_mode: host
+    depends_on:
+      - microros-agent
+    env_file:
+      - mqtt_secrets.env
+    volumes:
+      - .:/opt/fleet:ro
+    environment:
+      - ROS_DOMAIN_ID=0
+      - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/fleet/fastdds_udp.xml
+    command: >
+      bash -c "source /opt/ros/jazzy/setup.bash &&
+      exec python3 /opt/fleet/fleet_ha_bridge.py"
+    restart: unless-stopped
+
+  # Legacy single-mode brains (dev only — do not run alongside fleet-brain).
+  fleet-wander:
+    profiles: ["wander"]
+    image: ros:jazzy-ros-base
+    container_name: fleet-wander
+    network_mode: host
+    depends_on:
+      - microros-agent
+    volumes:
+      - .:/opt/fleet:ro
+    environment:
+      - ROS_DOMAIN_ID=0
+      - BOT_NS=${BOT_NS:-bot1}
+    command: >
+      bash -c "source /opt/ros/jazzy/setup.bash &&
+      exec python3 /opt/fleet/mini_wander.py"
+    restart: unless-stopped
+
+  fleet-beacon-chase:
+    profiles: ["chase"]
+    image: ros:jazzy-ros-base
+    container_name: fleet-beacon-chase
+    network_mode: host
+    depends_on:
+      - microros-agent
+    volumes:
+      - .:/opt/fleet:ro
+    environment:
+      - ROS_DOMAIN_ID=0
+      - BOT_NS=${BOT_NS:-bot1}
+    command: >
+      bash -c "source /opt/ros/jazzy/setup.bash &&
+      exec python3 /opt/fleet/beacon_chase.py"
+    restart: unless-stopped

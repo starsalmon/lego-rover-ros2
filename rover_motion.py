@@ -22,6 +22,8 @@ class ExploreMotionHints:
     memory_ang: float = 0.0
     radar_ang: float = 0.0
     front_blocked: bool = False
+    # Cruise already chose lin/ang from the sensor picture. Do not replace it.
+    picture: bool = False
 
 
 def arc_not_spin(lin: float, ang: float) -> tuple[float, float]:
@@ -41,6 +43,8 @@ def shape_explore_cmd(
     max_steer: float,
 ) -> tuple[float, float]:
     """Apply sensor shaping in fixed priority order — no duplicate passes."""
+    if hints.picture:
+        return lin, ang
     if not hints.allow_shaping:
         return prox.cap_forward_l8(lin, ang, max_steer=max_steer)
 

@@ -1,7 +1,8 @@
-"""Bench-tested rover explore + escape — extracted from autonomous_explore.py.
+"""Rover explore. Cruise steers from the nose picture, not from contact.
 
-Brain sends intent (cruise / wander / escape); ESP SmoothDrive + heading hold
-shape the motors. Escape fires on bump or stall only — not sonar proximity.
+L8 columns and the front ToF, plus the left and right ToFs, decide far / near /
+close. Open floor near 18 cm is a baseline, not a wall. Bump and stall are the
+backup when that picture is wrong. Sonar is not part of this picture.
 """
 from __future__ import annotations
 
@@ -110,6 +111,13 @@ def _front_ir_stop() -> bool:
     return False
 
 
+
+def _picture_enabled() -> bool:
+    """Nose L8/ToF picture cruise. Off → blind cruise/wander with bump/stall backup."""
+    return os.environ.get("ROVER_PICTURE", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
 def _sonar_front() -> bool:
     # Nose occupancy from VL53L8CX (pan sonar is aft).
     return os.environ.get('ROVER_FRONT_TOF', '1').strip().lower() not in (
@@ -178,6 +186,17 @@ class ExploreController:
         self._memory = LocalHeadingMemory()
         self._init_state()
         self._try_bg_radar()
+        if _picture_enabled():
+            self._log(
+                'explore picture on — L8 columns + side ToF, '
+                f'floor baseline {self._proximity.floor_baseline_m():.2f} m, '
+                'bump/stall backup'
+            )
+        else:
+            self._log(
+                'explore picture OFF (ROVER_PICTURE=0) — blind cruise/wander, '
+                'bump/stall (+ sonar/IR if live) backup'
+            )
 
     def _try_bg_radar(self) -> None:
         try:
@@ -272,6 +291,9 @@ class ExploreController:
         self._recover_yaw_need = 60.0
         self._memory.reset()
         self._memory.start_leg()
+        self._picture_band = ''
+        self._picture_hold = False
+        self._proximity.reset_picture()
         self._enter(Mode.CRUISE, random.uniform(4.0, 7.0))
 
     def reset(self) -> None:
@@ -282,8 +304,8 @@ class ExploreController:
                 pass
         self._init_state()
         self._log(
-            f'explore reset — cruise {_max_linear():.0%}, steer max {_max_steer():.2f}, '
-            f'escape bump/stall only'
+            f'explore reset — picture on, floor {self._proximity.floor_baseline_m():.2f} m, '
+            f'cruise {_max_linear():.0%}, bump/stall backup'
         )
 
     def shutdown(self) -> None:
@@ -848,10 +870,14 @@ class ExploreController:
                 self._trigger_escape()
 
         # Recover only when nose is in the wall AND wheels are not making progress.
-        if self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST) and now >= self._event_ignore_until:
+        if (
+            _picture_enabled()
+            and self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST)
+            and now >= self._event_ignore_until
+        ):
             if (
                 not self._proximity.in_corridor()
-                and self._proximity.is_nose_jammed()
+                and self._proximity.picture_front_blocked()
                 and not self._wheels_moving
                 and self._wheel_travel_m < 0.06
             ):
@@ -889,6 +915,23 @@ class ExploreController:
         elif self.mode == Mode.RECOVER:
             lin, ang = self._tick_recover(now)
 
+        self._picture_hold = False
+        if (
+            _picture_enabled()
+            and self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST)
+            and now >= self._scan_until
+        ):
+            lin, ang, band = self._proximity.cruise_picture(
+                max(0.0, lin), _max_steer(), self._wheel_travel_m,
+            )
+            self._picture_hold = True
+            if band != self._picture_band:
+                self._picture_band = band
+                locked = ' locked' if self._proximity.floor_locked() else ''
+                self._log(
+                    f'picture {band} — floor {self._proximity.floor_baseline_m():.2f} m{locked}'
+                )
+
         scanning = now < self._scan_until
         in_corridor = self.react_corridor()
         cruise_modes = self.mode in (Mode.CRUISE, Mode.WANDER, Mode.BURST)
@@ -917,6 +960,7 @@ class ExploreController:
             memory_ang=memory_ang,
             radar_ang=radar_ang,
             front_blocked=front_blocked,
+            picture=self._picture_hold,
         )
 
         # Scan finished: commit toward a real opening, never a coin-flip.

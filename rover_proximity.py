@@ -13,7 +13,35 @@ from __future__ import annotations
 import math
 import os
 import time
+from collections import deque
 from dataclasses import dataclass, field
+
+
+# Explore picture. Open floor sits near 18 cm in the nose beam. A reading
+# that steady is the floor, not a wall. A real obstacle is either closer
+# than that baseline, or a forward-row range that is not in the floor band.
+PICTURE_FLOOR_SEED_M = 0.18
+PICTURE_FLOOR_LO_M = 0.15
+PICTURE_FLOOR_HI_M = 0.24
+PICTURE_FLOOR_DROP_M = 0.03
+PICTURE_FRONT_FAR_M = 0.75
+PICTURE_FRONT_CLOSE_M = 0.38
+PICTURE_SIDE_NEAR_M = 0.55
+PICTURE_SIDE_CLOSE_M = 0.30
+PICTURE_SIDE_VETO_M = 0.20
+PICTURE_COMMIT_S = 2.5
+PICTURE_COMMIT_M = 0.70
+PICTURE_FRONT_STALE_S = 3.2
+# Side ToFs and the L8 both publish slower than 1 Hz. A 0.6 s window
+# went stale between frames and the cruise command dropped to zero.
+PICTURE_SIDE_STALE_S = 2.5
+PICTURE_DWELL_S = 2.0
+PICTURE_OPEN_M = 2.5
+# Steer-around (2026-10-14): curve toward the gap instead of stop/reverse/rotate.
+PICTURE_STEER_AROUND = os.environ.get('ROVER_PICTURE_STEER_AROUND', '1') != '0'
+PICTURE_BOX_M = float(os.environ.get('ROVER_PICTURE_BOX_M', '0.20'))
+PICTURE_BOX_EXIT_M = float(os.environ.get('ROVER_PICTURE_BOX_EXIT_M', '0.30'))
+PICTURE_GAP_HYST_M = float(os.environ.get('ROVER_PICTURE_GAP_HYST_M', '0.15'))
 
 
 def _f(name: str, default: float) -> float:
@@ -127,6 +155,435 @@ class ProximityState:
     _corridor_latched: bool = False
     _corridor_exit_since: float = 0.0
     _corridor_ang_filt: float = 0.0
+    _floor_m: float = PICTURE_FLOOR_SEED_M
+    _floor_locked: bool = False
+    _floor_hist: deque = field(default_factory=lambda: deque(maxlen=8))
+    _front_hist: deque = field(default_factory=deque)
+    _travel_hist: deque = field(default_factory=deque)
+    _picture_rank: int = 0
+    _picture_ease: int = 0
+    _picture_rank_since: float = 0.0
+    _commit_ang: float = 0.0
+    _commit_until: float = 0.0
+    _commit_travel: float = 0.0
+
+
+    def floor_baseline_m(self) -> float:
+        return self._floor_m
+
+    def floor_locked(self) -> bool:
+        return self._floor_locked
+
+    def reset_picture(self) -> None:
+        """Clear the short-term picture. Keep a floor baseline already learned."""
+        self._picture_rank = 0
+        self._steer_boxed = False
+        self._steer_sign = 0.0
+        self._steer_sign_since = 0.0
+        self._picture_ease = 0
+        self._picture_rank_since = 0.0
+        self._commit_ang = 0.0
+        self._commit_until = 0.0
+        self._commit_travel = 0.0
+        self._front_hist.clear()
+        self._travel_hist.clear()
+
+    def _note_floor(self, vals: list[float]) -> None:
+        band = [v for v in vals if PICTURE_FLOOR_LO_M <= v <= PICTURE_FLOOR_HI_M]
+        if len(band) < 3 or (max(band) - min(band)) > 0.02:
+            return
+        med = sorted(band)[len(band) // 2]
+        self._floor_hist.append(med)
+        if len(self._floor_hist) < 6:
+            return
+        if max(self._floor_hist) - min(self._floor_hist) > 0.02:
+            return
+        meds = sorted(self._floor_hist)
+        self._floor_m = meds[len(meds) // 2]
+        self._floor_locked = True
+
+    def _is_floor(self, v: float) -> bool:
+        """True when this return is the floor, not something in the way."""
+        if math.isnan(v) or v < self._floor_m - PICTURE_FLOOR_DROP_M:
+            return False
+        if self._floor_locked:
+            return abs(v - self._floor_m) <= 0.025
+        # Before the baseline locks, only the ~18 cm floor band is the floor.
+        # 0.22 m is already something you can bump, not open carpet.
+        return 0.165 <= v <= 0.205
+
+    def _picture_front_vals(self) -> list[float]:
+        now = time.monotonic()
+        vals: list[float] = []
+        if self._l8_cols_ms > 0.0 and (now - self._l8_cols_ms) <= PICTURE_FRONT_STALE_S:
+            vals.extend(v for v in self._l8_cols if not math.isnan(v))
+        if self._front_ms > 0.0 and (now - self._front_ms) <= PICTURE_FRONT_STALE_S:
+            for v in (self._front_m, self._front_l, self._front_r):
+                if not math.isnan(v):
+                    vals.append(v)
+        return vals
+
+    def _obstacle_front_m(self) -> float:
+        real = [v for v in self._picture_front_vals() if not self._is_floor(v)]
+        if not real:
+            return float('nan')
+        return min(real)
+
+    def _front_picture_stale(self, now: float) -> bool:
+        cols_ok = self._l8_cols_ms > 0.0 and (now - self._l8_cols_ms) <= PICTURE_FRONT_STALE_S
+        front_ok = self._front_ms > 0.0 and (now - self._front_ms) <= PICTURE_FRONT_STALE_S
+        return not (cols_ok or front_ok)
+
+    def _side_span(self, side: str) -> float | None:
+        """Metres of side clearance. Fresh no-return is open. None means stale."""
+        now = time.monotonic()
+        if side == 'left':
+            ms, val = self._tof_l_ms, self._tof_l
+        else:
+            ms, val = self._tof_r_ms, self._tof_r
+        if ms <= 0.0 or (now - ms) > PICTURE_SIDE_STALE_S:
+            return None
+        if math.isnan(val) or val <= 0.0:
+            return PICTURE_OPEN_M
+        return val
+
+    def _half_threat(self, side: str) -> float:
+        """Closest non-floor return on that half of the nose. Open if only floor."""
+        now = time.monotonic()
+        vals: list[float] = []
+        if self._l8_cols_ms > 0.0 and (now - self._l8_cols_ms) <= PICTURE_FRONT_STALE_S:
+            idxs = (0, 1, 2, 3) if side == 'left' else (4, 5, 6, 7)
+            for i in idxs:
+                v = self._l8_cols[i]
+                if not math.isnan(v):
+                    vals.append(v)
+        if self._front_ms > 0.0 and (now - self._front_ms) <= PICTURE_FRONT_STALE_S:
+            v = self._front_l if side == 'left' else self._front_r
+            if not math.isnan(v):
+                vals.append(v)
+        if not vals:
+            return float('nan')
+        real = [v for v in vals if not self._is_floor(v)]
+        if not real:
+            return PICTURE_OPEN_M
+        return min(real)
+
+    def _front_zone(self) -> tuple[int, float]:
+        """0 far, 1 near, 2 close. Sign is +left / -right, toward the open half."""
+        vals = self._picture_front_vals()
+        if not vals:
+            return 2, 0.0
+        if all(self._is_floor(v) for v in vals):
+            rank = 0
+        else:
+            closest = min(v for v in vals if not self._is_floor(v))
+            rank = self._front_band(closest)
+        left = self._half_threat('left')
+        right = self._half_threat('right')
+        sign = 0.0
+        if not math.isnan(left) and not math.isnan(right):
+            if left + 0.08 < right:
+                sign = -1.0
+            elif right + 0.08 < left:
+                sign = 1.0
+        return rank, sign
+
+    def _side_zone(self) -> tuple[int, float]:
+        left = self._side_span('left')
+        right = self._side_span('right')
+        if left is None or right is None:
+            return 2, 0.0
+        closer = min(left, right)
+        rank = self._side_band(closer)
+        sign = 0.0
+        if left + 0.05 < right:
+            sign = -1.0
+        elif right + 0.05 < left:
+            sign = 1.0
+        return rank, sign
+
+    def _veto_sign(self, sign: float) -> float:
+        """Never turn into a side that is already a wall. 0 if both are."""
+        if sign == 0.0:
+            return 0.0
+        left = self._side_span('left')
+        right = self._side_span('right')
+
+        def blocked(span: float | None) -> bool:
+            return span is not None and span < PICTURE_SIDE_VETO_M
+
+        if sign > 0.0 and blocked(left):
+            if right is not None and not blocked(right):
+                return -1.0
+            return 0.0
+        if sign < 0.0 and blocked(right):
+            if left is not None and not blocked(left):
+                return 1.0
+            return 0.0
+        return 1.0 if sign > 0.0 else -1.0
+
+    def _held_band(self) -> int:
+        """Current band, ignoring a stale hold."""
+        if self._picture_rank >= 3:
+            return 0
+        return self._picture_rank
+
+    def _front_band(self, closest: float) -> int:
+        """Hysteresis so a range near 0.38 m does not flip close and near."""
+        held = self._held_band()
+        if closest < self._floor_m - PICTURE_FLOOR_DROP_M:
+            return 2
+        # A wall you can still walk up to is not a stop. Reverse only inside
+        # about a body length; cruise while the nose is clear past half a metre,
+        # and keep going when it is clear past a metre.
+        if held >= 2:
+            close_at, far_at = 0.40, 0.70
+        elif held == 1:
+            close_at, far_at = 0.24, 0.65
+        else:
+            close_at, far_at = 0.28, 0.50
+        if closest < close_at:
+            return 2
+        if closest < far_at:
+            return 1
+        return 0
+
+    def _side_band(self, closer: float) -> int:
+        held = self._held_band()
+        # Hips a half-metre away are the room, not a wall. Only a body-width
+        # gap changes the band.
+        if held >= 2:
+            close_at, near_at = 0.28, 0.40
+        elif held == 1:
+            close_at, near_at = 0.18, 0.45
+        else:
+            close_at, near_at = 0.20, 0.35
+        if closer < close_at:
+            return 2
+        if closer < near_at:
+            return 1
+        return 0
+
+    def _sticky_rank(self, rank: int, now: float) -> int:
+        """Step up immediately. Keep a cautious band across one slow sensor frame.
+
+        Leaving stale is immediate once a sample is back.
+        """
+        if self._picture_rank >= 3 and rank < 3:
+            self._picture_rank = rank
+            self._picture_rank_since = now
+            return rank
+        if rank >= self._picture_rank:
+            if rank != self._picture_rank:
+                self._picture_rank_since = now
+            self._picture_rank = rank
+            return rank
+        if (now - self._picture_rank_since) < PICTURE_DWELL_S:
+            return self._picture_rank
+        self._picture_rank = rank
+        self._picture_rank_since = now
+        return rank
+
+    def _note_picture_motion(self, now: float, travel_m: float, closest: float | None) -> None:
+        if travel_m > 0.0:
+            self._travel_hist.append((now, travel_m))
+        self._front_hist.append((now, closest))
+        while self._travel_hist and (now - self._travel_hist[0][0]) > 1.0:
+            self._travel_hist.popleft()
+        while self._front_hist and (now - self._front_hist[0][0]) > 1.0:
+            self._front_hist.popleft()
+
+    def _closing_rank(self, rank: int, now: float) -> int:
+        travel = sum(d for t, d in self._travel_hist if (now - t) <= 0.8)
+        if travel < 0.06 or len(self._front_hist) < 2:
+            return rank
+        old = self._front_hist[0][1]
+        new = self._front_hist[-1][1]
+        if old is None or new is None:
+            return rank
+        if old - new > 0.12 and new < 0.50:
+            return min(2, rank + 1)
+        return rank
+
+    def _far_steer(self, max_steer: float) -> float:
+        left = self._side_span('left')
+        right = self._side_span('right')
+        if left is None or right is None:
+            return 0.0
+        # Hips lead. Nose columns only break a near-tie, so a long centre
+        # reading cannot hide a closer wall.
+        diff = left - right
+        lt = self._half_threat('left')
+        rt = self._half_threat('right')
+        if not math.isnan(lt) and not math.isnan(rt) and abs(diff) < 0.15:
+            nose = min(lt, PICTURE_OPEN_M) - min(rt, PICTURE_OPEN_M)
+            diff += max(-0.40, min(0.40, nose * 0.35))
+        # Both hips open: go straight. Do not weave on a 10 cm difference.
+        if min(left, right) > 0.45 and abs(diff) < 0.40:
+            return 0.0
+        if abs(diff) < 0.25:
+            return 0.0
+        cap = min(max_steer, 0.06)
+        return max(-cap, min(cap, (diff / 0.80) * cap))
+
+    def _commit_heading(self, ang: float, now: float, travel_m: float) -> float:
+        """Hold a far heading long enough to leave a 1 m pocket."""
+        if now < self._commit_until and self._commit_travel < PICTURE_COMMIT_M:
+            self._commit_travel += max(0.0, travel_m)
+            return self._commit_ang
+        self._commit_ang = ang
+        self._commit_until = now + PICTURE_COMMIT_S
+        self._commit_travel = 0.0
+        return ang
+
+    def picture_front_blocked(self) -> bool:
+        """Nose has a real obstacle, not the floor and not a stale beam."""
+        now = time.monotonic()
+        if self._front_picture_stale(now):
+            return False
+        rank, _sign = self._front_zone()
+        return rank >= 2
+
+    def cruise_picture(
+        self, cruise: float, max_steer: float, travel_m: float,
+    ) -> tuple[float, float, str]:
+        """Far / near / close command from the nose and the hips.
+
+        Far: cruise, steer toward the more open side.
+        Near: slow down and curve away.
+        Close: stop the ram and turn into the open side. A hip inside the
+        veto distance forbids that turn.
+        Stale front or side: do not roll forward as if the way were clear.
+        """
+        now = time.monotonic()
+        if self._front_picture_stale(now) or self._side_span('left') is None or self._side_span('right') is None:
+            self._sticky_rank(3, now)
+            return 0.0, 0.0, 'stale'
+
+        front_rank, front_sign = self._front_zone()
+        side_rank, side_sign = self._side_zone()
+        raw = max(front_rank, side_rank)
+        closest = self._obstacle_front_m()
+        self._note_picture_motion(now, max(0.0, travel_m), None if math.isnan(closest) else closest)
+        raw = self._closing_rank(raw, now)
+        rank = self._sticky_rank(raw, now)
+
+        if side_rank >= front_rank and side_sign != 0.0:
+            sign = side_sign
+        elif front_sign != 0.0:
+            sign = front_sign
+        else:
+            sign = side_sign
+        if sign == 0.0 and raw >= 2:
+            # Tied picture still has to leave. Peel toward the wider hip,
+            # and if they match, peel right so the choice does not chatter.
+            left = self._side_span('left')
+            right = self._side_span('right')
+            if left is None or right is None:
+                sign = 0.0
+            elif left > right + 0.02:
+                sign = 1.0
+            else:
+                sign = -1.0
+        sign = self._veto_sign(sign)
+
+        if rank >= 3:
+            return 0.0, 0.0, 'stale'
+        if PICTURE_STEER_AROUND:
+            return self._steer_around(cruise, max_steer, front_rank, side_rank, side_sign, sign, now)
+        if rank >= 2:
+            if sign == 0.0:
+                sign = self._veto_sign(-1.0)
+            if sign == 0.0:
+                return 0.0, 0.0, 'close'
+            # Nose in something: back off while turning. Hip only: creep-turn.
+            # lin 0 makes this ESP drop the turn. A dwell keeps the same
+            # command until the band is allowed to relax.
+            nose = front_rank >= 2 or rank > side_rank
+            lin = -0.08 if nose else 0.06
+            ang = sign * min(max_steer, 0.16)
+            return lin, ang, 'close'
+        if rank == 1:
+            # Still approach. A near wall is not a reason to creep-turn in place.
+            lin = min(max(0.0, cruise), max(0.10, cruise * 0.75))
+            ang = 0.0 if sign == 0.0 else sign * min(max_steer, 0.05)
+            return lin, ang, 'near'
+        lin = max(0.0, cruise)
+        ang = self._commit_heading(self._far_steer(max_steer), now, travel_m)
+        held = self._veto_sign(1.0 if ang > 0.02 else (-1.0 if ang < -0.02 else 0.0))
+        if held == 0.0:
+            ang = 0.0
+        elif ang > 0.02 and held < 0.0 or ang < -0.02 and held > 0.0:
+            ang = held * min(max_steer, 0.08)
+        return lin, ang, 'far'
+
+    def _steer_around(
+        self, cruise: float, max_steer: float, front_rank: int, side_rank: int,
+        side_sign: float, sign: float, now: float,
+    ) -> tuple[float, float, str]:
+        """Keep rolling and curve toward the open side; reverse only when boxed in.
+
+        Turn rate grows as the nose closes from PICTURE_FRONT_FAR_M to the box
+        distance. Gap side is held with hysteresis so it does not wiggle.
+        """
+        if not hasattr(self, '_steer_boxed'):
+            self._steer_boxed = False
+            self._steer_sign = 0.0
+            self._steer_sign_since = 0.0
+        lh = self._half_threat('left')
+        rh = self._half_threat('right')
+        sl = self._side_span('left')
+        sr = self._side_span('right')
+        lh = PICTURE_OPEN_M if math.isnan(lh) else lh
+        rh = PICTURE_OPEN_M if math.isnan(rh) else rh
+        sl = PICTURE_OPEN_M if sl is None else sl
+        sr = PICTURE_OPEN_M if sr is None else sr
+        closest = min(lh, rh)
+
+        # Boxed in: both halves of the nose inside the box distance (hysteresis).
+        if self._steer_boxed:
+            if max(lh, rh) > PICTURE_BOX_EXIT_M:
+                self._steer_boxed = False
+        elif max(lh, rh) < PICTURE_BOX_M:
+            self._steer_boxed = True
+        if self._steer_boxed:
+            gap = self._veto_sign(sign if sign != 0.0 else (1.0 if sl > sr else -1.0))
+            if gap == 0.0:
+                return 0.0, 0.0, 'boxed'
+            return -0.08, gap * min(max_steer, 0.16), 'boxed'
+
+        # Openness per side: nose half, tempered by that hip.
+        open_l = min(lh, sl * 1.5)
+        open_r = min(rh, sr * 1.5)
+        want = 1.0 if open_l > open_r else -1.0
+        held = self._steer_sign
+        if held == 0.0:
+            self._steer_sign = want
+            self._steer_sign_since = now
+        elif want != held and abs(open_l - open_r) > PICTURE_GAP_HYST_M \
+                and (now - self._steer_sign_since) >= 0.8:
+            self._steer_sign = want
+            self._steer_sign_since = now
+        gap = self._veto_sign(self._steer_sign)
+
+        far = PICTURE_FRONT_FAR_M
+        if closest < far:
+            t = (far - closest) / max(0.05, far - PICTURE_BOX_M)
+            t = max(0.0, min(1.0, t))
+            lin = max(0.06, max(0.0, cruise) * (1.0 - 0.5 * t))
+            ang = 0.0 if gap == 0.0 else gap * (0.04 + t * (min(max_steer, 0.18) - 0.04))
+            return lin, ang, ('close' if t >= 0.5 else 'near')
+        self._steer_sign = 0.0
+        if side_rank >= 2 and side_sign != 0.0:
+            # Hip close but nose clear: keep going, peel off the wall.
+            s2 = self._veto_sign(side_sign)
+            return max(0.06, max(0.0, cruise) * 0.7), s2 * min(max_steer, 0.10), 'near'
+        lin = max(0.0, cruise)
+        ang = self._commit_heading(self._far_steer(max_steer), now, 0.0)
+        hs = self._veto_sign(1.0 if ang > 0.02 else (-1.0 if ang < -0.02 else 0.0))
+        if hs == 0.0:
+            ang = 0.0
+        return lin, ang, 'far'
 
     def update_pan(self, pan_deg: float) -> None:
         self._pan_deg = float(pan_deg)
@@ -213,6 +670,11 @@ class ProximityState:
             self._front_l = _ok(left_m)
         if not math.isnan(right_m):
             self._front_r = _ok(right_m)
+        samples = [
+            v for v in (self._front_m, self._front_l, self._front_r) if not math.isnan(v)
+        ]
+        if samples:
+            self._note_floor(samples)
 
     def update_l8_cols(self, cols: list[float]) -> None:
         now = time.monotonic()
@@ -230,6 +692,7 @@ class ProximityState:
         vals = [v for v in out if not math.isnan(v)]
         if vals:
             self._push_l8_ema(min(vals))
+            self._note_floor(vals)
 
     def _front_fresh(self, max_age_s: float = 0.5) -> bool:
         return (time.monotonic() - self._front_ms) <= max_age_s
@@ -837,9 +1300,7 @@ class ProximityState:
         """Gradual nose slow/steer — must run in hallways too (ESP brakes at 24 cm)."""
         if lin <= 0.02:
             return lin, ang
-        fwd = self.front_center_m()
-        if math.isnan(fwd):
-            fwd = self.l8_col_min()
+        fwd = self._obstacle_front_m()
         if math.isnan(fwd):
             return lin, ang
         cfg = self.cfg
