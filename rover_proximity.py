@@ -42,6 +42,8 @@ PICTURE_STEER_AROUND = os.environ.get('ROVER_PICTURE_STEER_AROUND', '1') != '0'
 PICTURE_BOX_M = float(os.environ.get('ROVER_PICTURE_BOX_M', '0.20'))
 PICTURE_BOX_EXIT_M = float(os.environ.get('ROVER_PICTURE_BOX_EXIT_M', '0.30'))
 PICTURE_GAP_HYST_M = float(os.environ.get('ROVER_PICTURE_GAP_HYST_M', '0.15'))
+PICTURE_STEER_FAR_M = float(os.environ.get('ROVER_PICTURE_STEER_FAR_M', str(PICTURE_FRONT_FAR_M)))
+PICTURE_STEER_SLOW = float(os.environ.get('ROVER_PICTURE_STEER_SLOW', '0.5'))
 
 
 def _f(name: str, default: float) -> float:
@@ -566,11 +568,11 @@ class ProximityState:
             self._steer_sign_since = now
         gap = self._veto_sign(self._steer_sign)
 
-        far = PICTURE_FRONT_FAR_M
+        far = PICTURE_STEER_FAR_M
         if closest < far:
             t = (far - closest) / max(0.05, far - PICTURE_BOX_M)
             t = max(0.0, min(1.0, t))
-            lin = max(0.06, max(0.0, cruise) * (1.0 - 0.5 * t))
+            lin = max(0.06, max(0.0, cruise) * (1.0 - PICTURE_STEER_SLOW * t))
             ang = 0.0 if gap == 0.0 else gap * (0.04 + t * (min(max_steer, 0.18) - 0.04))
             return lin, ang, ('close' if t >= 0.5 else 'near')
         self._steer_sign = 0.0
