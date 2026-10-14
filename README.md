@@ -1,27 +1,14 @@
-# LEGO Rover — Pi scripts (legacy ROS stack)
+# LEGO Rover — brain code (ROS 2 Jazzy)
 
-**Brain is the NUC `brain` (192.168.3.172)** — `rover-brain` in Docker under `/data/swarm/robot-fleet`, ROS 2 Jazzy, micro-ROS agent UDP 8888. Rover is dual-board (T-Display drive + Pro S3 ToF). The Pi is not in the production path.
+Rover's brain runs on the NUC `brain` (192.168.3.172) as the `rover-brain` container under `/data/swarm/robot-fleet`, with one micro-ROS agent on UDP 8888 for all ESP clients. Rover is dual-board: T-Display drive (`rover-esp`) + Pro S3 ToF (`rover-tof`).
 
-## Current (use this)
+| Doc / file | Purpose |
+|------------|---------|
+| [ROVER_BEHAVIOR.md](ROVER_BEHAVIOR.md) | Explore: picture, steer-around, escapes, limits |
+| [ROVER_WANDER.md](ROVER_WANDER.md) | Mode roll (cruise / wander / burst) |
+| [BUTTON.md](BUTTON.md) | Go / E-stop, topics, ring and speaker cues |
+| [WIRING.md](WIRING.md) | Brain env; hardware pins live in `lego-rover-esp32/WIRING.md` |
+| `rover_brain.py`, `explore_controller.py`, `rover_proximity.py`, `rover_wheel_odom.py` | Rover brain node |
+| `docker-compose.yml` | Brain stack (synced from the brain) |
 
-| Doc / script | Purpose |
-|--------------|---------|
-| [PI_PERIPHERAL.md](PI_PERIPHERAL.md) | Architecture — ESP brain, Pi = speaker + ring |
-| `pi_peripheral_daemon.py` | UART listener → chimes + WS2812 |
-| `install_pi_peripheral.sh` | systemd service, disables old agent/main |
-| [ROVER_BEHAVIOR.md](ROVER_BEHAVIOR.md) | Drive / sonar / stall logic (ESP) |
-
-**ESP firmware:** `../lego-rover-esp32` — OTA env `s3_tdisplay_microros_rover_ota`.
-
-## Legacy (Pi as ROS brain — deprecated on-robot)
-
-Not used for normal driving anymore. Kept for Mac teleop / capture experiments.
-
-| Area | Examples |
-|------|----------|
-| Autonomous | `go_auto.sh`, `autonomous_explore.py`, `rover_main.sh` |
-| micro-ROS | `rover-agent.service`, `install_agent_service.sh` |
-| Capture | `record_sonar_escape_session.sh` |
-| Teleop | `go.sh`, `teleop_mac_ssh.py` |
-
-Fleet ROS runs on the **NUC brain** with all ESPs over **WiFi** micro-ROS (same pattern as `c3-mini-bot`).
+**Firmware:** `../lego-rover-esp32`.

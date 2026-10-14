@@ -26,7 +26,7 @@ alwaysApply: true
 
 - Rover pan servo is on **PCA9685** (no spare GPIOs — see `WIRING.md`).
 - Smooth motion needs **steady update timing** — don't tie servo writes to a slow/jittery main loop.
-- Shared I2C bus (MPU, MCP, PCA) must be **mutex-protected** if multiple tasks touch Wire.
+- Shared I2C buses (MPU6050 on the drive board; L8 / side ToF / PCA9685 on the Pro S3) must be **mutex-protected** if multiple tasks touch Wire.
 
 ## Power & E-stop
 

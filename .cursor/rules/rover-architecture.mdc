@@ -5,11 +5,11 @@ alwaysApply: true
 
 # Fleet & rover architecture
 
-**Source of truth:** `lego-rover-esp32/WIRING.md`, `lego-rover-ros2/WIRING.md`, `c3-mini-bot/WIRING.md`, `c3-mini-bot/docs/SWARM.md`
+**Source of truth:** `lego-rover-esp32/WIRING.md`, `lego-rover-ros2/ROVER_BEHAVIOR.md`, `c3-mini-bot/WIRING.md`, `c3-mini-bot/docs/SWARM.md`
 
 ## Compute split (current production)
 
-**Brain** = NUC11 Ubuntu host `brain` at **192.168.3.172**. Docker stack in `/data/swarm/robot-fleet` (`rover-brain`, `fleet-brain`, `tracked-brain`, `microros-agent`, `fleet-ha`), **ROS 2 Jazzy**. dockerhost is no longer the brain.
+**Brain** = NUC11 Ubuntu host `brain` at **192.168.3.172**. Docker stack in `/data/swarm/robot-fleet` (`rover-brain`, `fleet-brain`, `tracked-brain`, `microros-agent`, `fleet-ha`), **ROS 2 Jazzy**.
 
 | Bot | Fleet ID | Brain container | ESP role | ROS namespace |
 |-----|----------|-----------------|----------|---------------|
@@ -80,10 +80,10 @@ Highest wins — motors are ESP's last word:
 - ToF board: `um_pros3_tof_microros` (USB) / `um_pros3_tof_microros_ota`.
 - Mini: `c3-bot1.local` — `c3_mini_wifi_ota`
 
-## Planned
-
-- Camera-based mapping: FireBeetle 2 ESP32-S3 + OV3660 → RTAB-Map, Nav2, explore_lite (next milestone).
-
 ## Robot personality
 
 Features belong **in the robot** (firmware + always-on brain), triggered by **Go button**, sensors, or timers — not manual shell scripts. See `robot-personality.mdc`.
+
+## Roadmap (not yet built)
+
+- Camera-based mapping: FireBeetle 2 ESP32-S3 + OV3660 → RTAB-Map, Nav2, explore_lite (next milestone).
