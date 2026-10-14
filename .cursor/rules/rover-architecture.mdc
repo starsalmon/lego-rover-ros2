@@ -9,43 +9,59 @@ alwaysApply: true
 
 ## Compute split (current production)
 
-| Robot | Fleet ID | Brain | ESP role | ROS namespace |
-|-------|----------|-------|----------|---------------|
-| **LEGO rover** | bot0 | **dockerhost** (not Pi) | Thin client — motors, IMU, sonar, IR, display, safety | `/rover/…` |
-| **c3-mini** (Roby, etc.) | bot1+ | **dockerhost** `fleet-brain` | Thin client — servos, sonar pan, IMU, IR | `/bot1/…`, `/bot2/…` |
+**Brain** = NUC11 Ubuntu host `brain` at **192.168.3.172**. Docker stack in `/data/swarm/robot-fleet` (`rover-brain`, `fleet-brain`, `tracked-brain`, `microros-agent`, `fleet-ha`), **ROS 2 Jazzy**. dockerhost is no longer the brain.
 
-- **Pi is not in the production path** — optional legacy for buzzer/ring only; do not route brain logic through Pi UART.
-- **One micro-ROS agent** on dockerhost (UDP **8888**), multiplexes all ESP clients.
+| Bot | Fleet ID | Brain container | ESP role | ROS namespace |
+|-----|----------|-----------------|----------|---------------|
+| **Rover** (LEGO, dual-board) | 0 | `rover-brain` | Thin clients — drive board + ToF board | `/rover/…`, `/imu/data`, `/cmd_vel` |
+| **Roby** (c3-mini) | 1 | `fleet-brain` | Thin client — servos, sonar pan, IMU, IR | `/bot1/…` |
+| **Tracker** | 2 | `tracked-brain` | Thin client — tracked drive | `/bot2/…` |
+| **Beaper** | 4 | — | WIP | — |
+
+- **One micro-ROS agent** on the brain (UDP **8888**), multiplexes all ESP clients.
 - **One `cmd_vel` publisher per bot** at a time.
+- **allow_drive** gate via MQTT `lab/robots/allow_drive/set` (`ON`/`OFF`) → `/fleet/allow_drive`.
+- micro-ROS session tolerance: agent is declared lost only after **6 consecutive missed pings** (200 ms period).
 
-## LEGO rover ESP (T-Display-S3)
+## Rover — dual-board
 
-**No spare GPIOs** — pan servo is on PCA9685, not a free pin. See `WIRING.md` pin map.
+### Drive board: T-Display-S3 (`rover-esp`, 192.168.3.71)
 
 | Bus / pin | Device / role |
 |-----------|---------------|
 | GPIO 1,2,3,10 | Motors L/R via TC78H660 (A=left, B=right) |
-| GPIO 11,12 | HC-SR04 TRIG/ECHO (echo level-shifted) |
-| GPIO 21 | 38 kHz IR chase beacon (for mini-bot TSOP) |
-| I2C 43/44 | MPU6050 **0x68**, MCP **0x21**, PCA9685 **0x40**, VL53L1X **0x30/0x31**, VL53L8CX **0x29** |
-| PCA ch 0 | Rear pan sonar servo |
+| GPIO 11,12 | Wheel ticks, direct GPIO ISR (95 mm wheels, 60 slits/rev, 130 mm track) |
+| I2C 43/44 | MPU6050 IMU **0x68** only |
+| GPIO 17/18 | Speaker / WS2812 LED ring (distance colours from the Pro S3 ToF topics) |
+| GPIO 0 | Go button / E-stop |
 
-Transport: **WiFi micro-ROS** → dockerhost (`ROVER_MICROROS_WIFI`, agent IP in `platformio.ini`).
+No IR/MCP expander, no sonar, no local ToF. Env `s3_tdisplay_microros_rover_drive` (`ROVER_DRIVE_ONLY=1`). Diagnostics on `/rover/drive_diag` (1 Hz string).
 
-## ESP safety priority (rover)
+### ToF board: UM Pro S3 (`rover-tof`)
+
+- **VL53L8CX** front on its own I2C bus at **400 kHz**; **VL53L0X** left/right + **PCA9685** on the second bus.
+- Publishes `/rover/tof/front`, `front_left`, `front_right`, `l8_cols`, `left`, `right`.
+- Onboard ceramic antenna (`ROVER_PROS3_ANT_EXTERNAL=0`). Env `um_pros3_tof_microros`.
+
+Transport (both boards): **WiFi micro-ROS** → brain agent `192.168.3.172:8888`.
+
+## ESP safety priority (drive board)
 
 Highest wins — motors are ESP's last word:
 
-1. E-stop (GPIO 0) / low battery
-2. Stall lockout (~4 s)
-3. Sonar hard brake (reverse / aft only — brain owns escape)
-4. L8 nose brake (forward)
-5. Heading hold trim
-6. Brain `/cmd_vel` (dockerhost)
-7. Cmd timeout (400 ms → stop)
+1. E-stop / low battery
+2. IMU + wheel-tick stall lockout (~2.5 s)
+3. Heading hold trim
+4. Brain `/cmd_vel`
+5. Cmd timeout (400 ms → stop)
 
-**ESP:** smooth pan wiggle, publish range, emergency forward brake only.  
-**Brain:** wander, escape, logging — not an 800-line FSM on the ESP.
+**ESP:** sensing, publish, local safety only.  
+**Brain:** explore, escape, logging — not an FSM on the ESP.
+
+## Explore (brain)
+
+- Reactive **picture** from L8 columns + side ToF (`ROVER_PICTURE=1`) with **steer-around** (`ROVER_PICTURE_STEER_AROUND`): slow and curve toward the open side; reverse only when boxed in, or on bump/stall.
+- **Speed cap 25% usable** (`ROVER_AUTO_MAX_LINEAR=0.25`). The cmd value is the fraction of the usable motor range above the firmware's PWM floor; always quote speeds as usable %.
 
 ## c3-mini-bot (C3 Zero)
 
@@ -55,14 +71,18 @@ Highest wins — motors are ESP's last word:
 
 ## Swarm coordination
 
-- Rover **TX beacon** (GPIO21) → mini **RX TSOP** (GPIO7 on pan).
-- Bot-to-bot via ROS topics on dockerhost, not ESP mesh (future: IR pulse patterns, not 38 kHz TSOP).
+- Bot-to-bot via ROS topics on the brain, not ESP mesh.
 
 ## Flashing
 
-- Default **OTA** when bot is **stopped** (see `ota-safety.mdc`).
-- Rover: `rover-esp.local` — `s3_tdisplay_microros_rover_ota`
+- Default **OTA** when bot is **stopped** (allow_drive OFF; see `ota-safety.mdc`).
+- Drive board: build `s3_tdisplay_microros_rover_drive`, then `espota.py -i 192.168.3.71 -p 3232`.
+- ToF board: `um_pros3_tof_microros` (USB) / `um_pros3_tof_microros_ota`.
 - Mini: `c3-bot1.local` — `c3_mini_wifi_ota`
+
+## Planned
+
+- Camera-based mapping: FireBeetle 2 ESP32-S3 + OV3660 → RTAB-Map, Nav2, explore_lite (next milestone).
 
 ## Robot personality
 

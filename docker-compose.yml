@@ -93,8 +93,8 @@ services:
       - ROVER_SONAR=1
       - ROVER_CRUISE_RADAR=0
       # Slightly slower default gives the brain time to steer away before ESP braking.
-      # SPEED EXPERIMENT 2026-10-14: 75% motor duty. Duty = 0.55 + lin*0.45, so 0.44 -> 75%.
-      # Revert: set back to 0.16 (62% duty) and delete the four lines below it.
+      # Speed cap 25% usable (cmd 0.25 = 25% of the usable range above the firmware PWM floor).
+      # Burst capped to match; gentle 10% reverse; steer-around starts curving at 1.10 m.
       - ROVER_AUTO_MAX_LINEAR=${ROVER_AUTO_MAX_LINEAR:-0.25}
       - ROVER_AUTO_REVERSE_POWER=0.10
       - ROVER_AUTO_BURST_MAX=0.25

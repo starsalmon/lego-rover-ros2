@@ -1,6 +1,6 @@
 # LEGO Rover — Pi scripts (legacy ROS stack)
 
-**On-robot brain moved to ESP32.** The Pi is now a **peripheral co-processor** only.
+**Brain is the NUC `brain` (192.168.3.172)** — `rover-brain` in Docker under `/data/swarm/robot-fleet`, ROS 2 Jazzy, micro-ROS agent UDP 8888. Rover is dual-board (T-Display drive + Pro S3 ToF). The Pi is not in the production path.
 
 ## Current (use this)
 
@@ -15,7 +15,7 @@
 
 ## Legacy (Pi as ROS brain — deprecated on-robot)
 
-Not used for normal driving anymore. Kept for dockerhost / Mac teleop / capture experiments.
+Not used for normal driving anymore. Kept for Mac teleop / capture experiments.
 
 | Area | Examples |
 |------|----------|
@@ -24,4 +24,4 @@ Not used for normal driving anymore. Kept for dockerhost / Mac teleop / capture 
 | Capture | `record_sonar_escape_session.sh` |
 | Teleop | `go.sh`, `teleop_mac_ssh.py` |
 
-Fleet ROS can run on **dockerhost** with ESP over **WiFi** later (same pattern as `c3-mini-bot`).
+Fleet ROS runs on the **NUC brain** with all ESPs over **WiFi** micro-ROS (same pattern as `c3-mini-bot`).

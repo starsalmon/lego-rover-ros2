@@ -1,5 +1,7 @@
 # LEGO Rover — Pi wiring (Raspberry Pi Zero 2W)
 
+> Legacy: the Pi is not used on the current Rover. Current Rover is dual-board (T-Display drive: motors, MPU6050, wheel ticks GPIO 11/12, ring; Pro S3: VL53L8CX + VL53L0X sides + PCA9685); no MCP expander.
+
 Motors, IMU, body MCP23008, pan servo (PCA9685 ch 0), and IR chase beacon are on the **ESP32** — see [`lego-rover-esp32/WIRING.md`](../lego-rover-esp32/WIRING.md).
 
 This doc is **Pi GPIO only**: UART to ESP, buzzer, LED ring, and optional legacy wiring.
